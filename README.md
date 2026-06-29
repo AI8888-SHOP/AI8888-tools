@@ -1,0 +1,30 @@
+﻿# AI8888 Tools
+
+AI8888 Tools is a Tauri desktop client for managing AI8888 API configuration across local coding tools. It can synchronize account, subscription, group, and API key information, write local configuration for Codex, Claude Code, OpenCode, OpenClaw, and Hermes, manage local routing, browse and resume local Codex sessions, and check for application updates from GitHub Releases.
+
+Current version: v0.0.1
+
+## Features
+
+- Account login and API key management for AI8888.
+- Multi-tool configuration writing for Codex, Claude Code, OpenCode, OpenClaw, and Hermes.
+- Endpoint probing across AI8888 domains for regions where some domains may be blocked.
+- Standalone Codex session manager with browsing, multi-select resume, and session visibility repair.
+- GitHub Releases based update check from the main window footer.
+
+## Open Source Acknowledgements
+
+This project thanks and references ideas from these open source projects:
+
+- cockpit-tools: https://github.com/jlcodes99/cockpit-tools
+- cc-switch: https://github.com/jlcodes99/cc-switch
+- sub2api: https://github.com/Wei-Shaw/sub2api
+
+## Development
+
+```bash
+npm install
+npm run typecheck
+cargo check -q --manifest-path src-tauri\Cargo.toml
+npm run build:renderer
+```

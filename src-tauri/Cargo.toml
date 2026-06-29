@@ -1,0 +1,40 @@
+[package]
+name = "ai8888-switch"
+version = "0.0.1"
+description = "AI8888 Switch desktop client"
+authors = ["OpenAI"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.85.0"
+
+[lib]
+name = "ai8888_switch_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+doctest = false
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+dirs = "5"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tauri = { version = "2.11.3", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2.4.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+axum = "0.7"
+toml = "0.8"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "unwind"
+strip = "symbols"
+
+
+

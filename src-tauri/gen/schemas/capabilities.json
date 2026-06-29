@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default desktop permissions for AI8888 Switch","local":true,"windows":["main","login","codex-sessions"],"permissions":["core:default"]}}

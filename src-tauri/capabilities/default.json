@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default desktop permissions for AI8888 Switch",
+  "windows": ["main", "login", "codex-sessions"],
+  "permissions": ["core:default"]
+}
