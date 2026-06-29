@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 use tools::{build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
 
 const CURRENT_APP_VERSION: &str = "v0.0.1";
-const GITHUB_UPDATE_REPOSITORY: &str = "mxsyu/AI8888-tools";
+const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 
 pub struct SharedState {
   pub api: ApiClient,
