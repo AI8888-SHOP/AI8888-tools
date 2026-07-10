@@ -14,12 +14,17 @@ use config::{ensure_app_dir, local_route_manifest_path, read_json, state_path, w
 use error::AppError;
 use local_proxy::ensure_local_proxy;
 use models::{AccountSummary, ApiKeySummary, AppStateData, EndpointProbeSummary, GroupSummary, LocalRouteManifest, LocalRouteStatus, LoginResult, ModelSummary, Pagination, StoredSession, SubscriptionSummary, SwitchTarget, ToolProfile, UpdateCheckResult};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
 use tokio::sync::RwLock;
 use tools::{build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
 
-const CURRENT_APP_VERSION: &str = "v0.0.1";
+const CURRENT_APP_VERSION: &str = "v0.0.2";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
+const TRAY_ID: &str = "main-tray";
+const TRAY_SHOW_ID: &str = "tray-show";
+const TRAY_QUIT_ID: &str = "tray-quit";
 
 pub struct SharedState {
   pub api: ApiClient,
@@ -231,8 +236,8 @@ async fn app_get_codex_session_messages(source_path: String) -> Result<Vec<Codex
 }
 
 #[tauri::command]
-async fn app_launch_codex_session(session_id: String, cwd: Option<String>) -> Result<(), String> {
-  tauri::async_runtime::spawn_blocking(move || codex_sessions::launch_resume(&session_id, cwd.as_deref()))
+async fn app_launch_codex_session(session_id: String, cwd: Option<String>, model_provider_key: Option<String>) -> Result<(), String> {
+  tauri::async_runtime::spawn_blocking(move || codex_sessions::launch_resume(&session_id, cwd.as_deref(), model_provider_key.as_deref()))
     .await
     .map_err(|err| format!("failed to launch Codex session: {err}"))?
     .map_err(|err| err.to_string())
@@ -559,13 +564,52 @@ async fn app_restore_local_route_backups() -> Result<Vec<(String, String)>, Stri
   restore_local_route_backups().map_err(|err| err.to_string())
 }
 
+fn show_main_window(app: &tauri::AppHandle) {
+  if let Some(window) = app.get_webview_window("main") {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+  }
+}
+
+fn setup_system_tray(app: &tauri::App) -> tauri::Result<()> {
+  let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示主窗口", true, None::<&str>)?;
+  let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "退出", true, None::<&str>)?;
+  let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+  let mut tray = TrayIconBuilder::with_id(TRAY_ID)
+    .menu(&menu)
+    .show_menu_on_left_click(false)
+    .tooltip("AI8888 Switch");
+  if let Some(icon) = app.default_window_icon() {
+    tray = tray.icon(icon.clone());
+  }
+
+  tray
+    .on_menu_event(|app, event| match event.id().as_ref() {
+      TRAY_SHOW_ID => show_main_window(app),
+      TRAY_QUIT_ID => app.exit(0),
+      _ => {}
+    })
+    .on_tray_icon_event(|tray, event| {
+      if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Up,
+        ..
+      } = event
+      {
+        show_main_window(tray.app_handle());
+      }
+    })
+    .build(app)?;
+
+  Ok(())
+}
+
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-      if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
-      }
+      show_main_window(app);
     }))
     .setup(|app| {
       let shared = SharedState::new().map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
@@ -577,7 +621,16 @@ pub fn run() {
         *shared.data.blocking_write() = stored;
       }
       app.manage(shared);
+      setup_system_tray(app)?;
       Ok(())
+    })
+    .on_window_event(|window, event| {
+      if window.label() == "main" {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+          api.prevent_close();
+          let _ = window.hide();
+        }
+      }
     })
     .invoke_handler(tauri::generate_handler![
       app_get_state,

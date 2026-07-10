@@ -1,0 +1,59 @@
+name: Build desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            artifact: windows-x64
+            build_args: ""
+            bundle_path: src-tauri/target/release/bundle/**/*
+          - platform: ubuntu-22.04
+            artifact: linux-x64
+            build_args: ""
+            bundle_path: src-tauri/target/release/bundle/**/*
+          - platform: macos-latest
+            artifact: macos-universal
+            build_args: --target universal-apple-darwin
+            bundle_path: src-tauri/target/universal-apple-darwin/release/bundle/**/*
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install macOS universal Rust targets
+        if: matrix.platform == 'macos-latest'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - run: npm ci
+
+      - name: Build packages
+        run: npm run tauri build -- ${{ matrix.build_args }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai8888-switch-v0.0.2-${{ matrix.artifact }}
+          path: ${{ matrix.bundle_path }}
+          if-no-files-found: error

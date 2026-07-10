@@ -2,7 +2,7 @@
 
 AI8888 Tools is a Tauri desktop client for managing AI8888 API configuration across local coding tools. It can synchronize account, subscription, group, and API key information, write local configuration for Codex, Claude Code, OpenCode, OpenClaw, and Hermes, manage local routing, browse and resume local Codex sessions, and check for application updates from GitHub Releases.
 
-Current version: v0.0.1
+Current version: v0.0.2
 
 ## Features
 

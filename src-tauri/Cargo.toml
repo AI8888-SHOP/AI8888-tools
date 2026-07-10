@@ -1,6 +1,6 @@
 [package]
 name = "ai8888-switch"
-version = "0.0.1"
+version = "0.0.2"
 description = "AI8888 Switch desktop client"
 authors = ["OpenAI"]
 license = "MIT"
@@ -35,6 +35,5 @@ lto = "thin"
 opt-level = "s"
 panic = "unwind"
 strip = "symbols"
-
 
 

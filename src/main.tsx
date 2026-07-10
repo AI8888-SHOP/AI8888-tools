@@ -17,7 +17,7 @@ type LocalRouteStatus = { app: string; detected: boolean; configPath: string; ba
 type EndpointProbeResult = { domain: string; baseUrl: string; attempts: number; successCount: number; packetLoss: number; averageLatencyMs?: number | null; bestLatencyMs?: number | null; selected: boolean; error?: string | null };
 type EndpointProbeSummary = { selectedBaseUrl: string; selectedDomain: string; results: EndpointProbeResult[] };
 type UpdateCheckResult = { currentVersion: string; latestVersion?: string | null; updateAvailable: boolean; releaseUrl?: string | null; repository: string; error?: string | null };
-type CodexSessionMeta = { sessionId: string; title?: string | null; summary?: string | null; projectDir?: string | null; createdAt?: string | null; lastActiveAt?: string | null; sourcePath: string; resumeCommand: string; archived: boolean; modifiedAt: number };
+type CodexSessionMeta = { sessionId: string; title?: string | null; summary?: string | null; projectDir?: string | null; createdAt?: string | null; lastActiveAt?: string | null; modelProvider?: string | null; modelProviderKey?: string | null; sourcePath: string; resumeCommand: string; archived: boolean; modifiedAt: number };
 type CodexSessionMessage = { role: string; content: string; timestamp?: string | null };
 type CodexSessionVisibilityRepairOutcome = { sessionId: string; sourcePath: string; success: boolean; changed: boolean; error?: string | null };
 
@@ -62,7 +62,7 @@ function AuthGate(props: { email: string; password: string; setEmail: (v: string
           <button onClick={props.onLogin} disabled={props.busy || !props.email || !props.password}>登录</button>
         </div>
       </section>
-      <footer className="appFooter">v0.0.1 Copyright AI8888.SHOP 2026</footer>
+      <footer className="appFooter">v0.0.2 Copyright AI8888.SHOP 2026</footer>
     </main>
   );
 }
@@ -140,7 +140,7 @@ function CodexSessionsApp() {
   const filtered = useMemo(() => {
     const text = query.trim().toLowerCase();
     if (!text) return sessions;
-    return sessions.filter((session) => [session.sessionId, session.title, session.summary, session.projectDir, session.sourcePath].some((value) => (value || "").toLowerCase().includes(text)));
+    return sessions.filter((session) => [session.sessionId, session.title, session.summary, session.projectDir, session.modelProvider, session.sourcePath].some((value) => (value || "").toLowerCase().includes(text)));
   }, [query, sessions]);
 
   const selectedBatch = useMemo(() => sessions.filter((session) => selectedPaths.has(session.sourcePath)), [sessions, selectedPaths]);
@@ -171,7 +171,7 @@ function CodexSessionsApp() {
     try {
       for (const target of targets) {
         try {
-          await invoke("app_launch_codex_session", { sessionId: target.sessionId, cwd: target.projectDir ?? null });
+          await invoke("app_launch_codex_session", { sessionId: target.sessionId, cwd: target.projectDir ?? null, modelProviderKey: target.modelProviderKey ?? null });
         } catch (err) {
           failed.push(`${target.resumeCommand}  # ${String(err)}`);
         }
@@ -234,14 +234,14 @@ function CodexSessionsApp() {
               const checked = selectedPaths.has(session.sourcePath);
               return <article className={"sessionItem " + (selected?.sourcePath === session.sourcePath ? "selected " : "") + (checked ? "checked" : "")} key={session.sourcePath} onClick={() => setSelected(session)}>
                 <input aria-label="\u9009\u62e9\u4f1a\u8bdd" type="checkbox" checked={checked} onChange={(event) => toggleSelection(session, event.target.checked)} onClick={(event) => event.stopPropagation()} />
-                <div><strong>{sessionTitle(session)}</strong><small>{displayTime(session.lastActiveAt ?? session.createdAt)}{session.archived ? " - \u5df2\u5f52\u6863" : ""}</small><small>{session.projectDir || session.sessionId}</small></div>
+                <div><strong>{sessionTitle(session)}</strong><small>{displayTime(session.lastActiveAt ?? session.createdAt)}{session.modelProvider ? ` - ${session.modelProvider}` : ""}{session.archived ? " - \u5df2\u5f52\u6863" : ""}</small><small>{session.projectDir || session.sessionId}</small></div>
               </article>;
             })}
           </div>
         </aside>
         <section className="panel sessionDetailPanel">
           {!selected ? <div className="emptyState"><h2>{"\u9009\u62e9\u4e00\u4e2a\u4f1a\u8bdd"}</h2><p className="muted">{"\u9009\u4e2d Codex \u4f1a\u8bdd\u540e\uff0c\u53ef\u67e5\u770b\u6d88\u606f\u548c\u6062\u590d\u547d\u4ee4\u3002"}</p></div> : <>
-            <div className="panelHead sessionDetailHead"><div><h2>{sessionTitle(selected)}</h2><p className="muted">{selected.projectDir || "\u672a\u8bb0\u5f55\u9879\u76ee\u76ee\u5f55"}</p></div><div className="actions"><button onClick={() => launchSessions([selected])} disabled={busy}>{"\u6062\u590d\u4f1a\u8bdd"}</button><button className="secondary" onClick={() => copy(selected.resumeCommand, "\u5df2\u590d\u5236\u6062\u590d\u547d\u4ee4")}>{"\u590d\u5236\u547d\u4ee4"}</button></div></div>
+            <div className="panelHead sessionDetailHead"><div><h2>{sessionTitle(selected)}</h2><p className="muted">{selected.projectDir || "\u672a\u8bb0\u5f55\u9879\u76ee\u76ee\u5f55"}{selected.modelProvider ? ` · Provider: ${selected.modelProvider}` : ""}</p></div><div className="actions"><button onClick={() => launchSessions([selected])} disabled={busy}>{"\u6062\u590d\u4f1a\u8bdd"}</button><button className="secondary" onClick={() => copy(selected.resumeCommand, "\u5df2\u590d\u5236\u6062\u590d\u547d\u4ee4")}>{"\u590d\u5236\u547d\u4ee4"}</button></div></div>
             <div className="resumeBox"><code>{selected.resumeCommand}</code><button className="ghost mini" onClick={() => copy(selected.sourcePath, "\u5df2\u590d\u5236\u6e90\u6587\u4ef6\u8def\u5f84")}>{"\u590d\u5236\u8def\u5f84"}</button></div>
             <div className="messageList">
               {messages.length === 0 && <p className="muted">{"\u6b64\u4f1a\u8bdd\u6ca1\u6709\u53ef\u663e\u793a\u7684\u6d88\u606f\u3002"}</p>}
@@ -419,7 +419,7 @@ function CodexSessionsApp() {
       {preview.length > 0 && <section className="panel"><div className="panelHead"><h2>写入目标</h2></div><div className="list">{preview.map(([path, label]) => <article className="row" key={path}><div><strong>{label}</strong><small>{path}</small></div></article>)}</div></section>}
       {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
             <footer className="appFooter">
-        <div>v0.0.1 Copyright AI8888.SHOP 2026</div>
+        <div>v0.0.2 Copyright AI8888.SHOP 2026</div>
         <div className="footerActions"><button className="ghost mini" onClick={checkUpdate} disabled={checkingUpdate}>{checkingUpdate ? "\u68c0\u67e5\u4e2d" : "\u68c0\u67e5\u66f4\u65b0"}</button>{updateInfo?.releaseUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">{updateInfo.updateAvailable ? "\u67e5\u770b\u65b0\u7248\u672c" : "GitHub Releases"}</a>}</div>
         {updateInfo && <div className="muted">{updateInfo.updateAvailable ? `\u53d1\u73b0\u65b0\u7248\u672c ${updateInfo.latestVersion}` : updateInfo.error ? `\u66f4\u65b0\u68c0\u67e5\u5931\u8d25\uff1a${updateInfo.error}` : `\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c ${updateInfo.currentVersion}`}</div>}
         <div className="credits">{"\u81f4\u8c22\u5f00\u6e90\u9879\u76ee\uff1a"}<a href="https://github.com/jlcodes99/cockpit-tools" target="_blank" rel="noreferrer">cockpit-tools</a><a href="https://github.com/jlcodes99/cc-switch" target="_blank" rel="noreferrer">cc-switch</a><a href="https://github.com/Wei-Shaw/sub2api" target="_blank" rel="noreferrer">sub2api</a></div>

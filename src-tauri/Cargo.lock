@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ai8888-switch"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "axum",
  "dirs 5.0.1",

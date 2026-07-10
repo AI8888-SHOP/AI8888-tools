@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,13 @@ use crate::error::AppError;
 
 const VSCODE_CONTEXT_PREFIX: &str = "# Context from my IDE setup:";
 const CODEX_REQUEST_MARKER: &str = "my request for codex";
-const VISIBLE_MODEL_PROVIDER: &str = "ai8888";
+const DEFAULT_MODEL_PROVIDER: &str = "ai8888";
+
+#[derive(Default)]
+struct ModelProviderLookup {
+  aliases: HashMap<String, String>,
+  active_name: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +29,8 @@ pub struct CodexSessionMeta {
   pub project_dir: Option<String>,
   pub created_at: Option<String>,
   pub last_active_at: Option<String>,
+  pub model_provider: Option<String>,
+  pub model_provider_key: Option<String>,
   pub source_path: String,
   pub resume_command: String,
   pub archived: bool,
@@ -56,6 +64,7 @@ pub struct CodexSessionVisibilityRepairOutcome {
 
 
 pub fn scan_sessions() -> Vec<CodexSessionMeta> {
+  let providers = load_model_provider_lookup();
   let mut files = Vec::new();
   for root in session_roots() {
     collect_jsonl_files(&root, &mut files);
@@ -63,7 +72,7 @@ pub fn scan_sessions() -> Vec<CodexSessionMeta> {
 
   let mut sessions = files
     .into_iter()
-    .filter_map(|path| parse_session(&path))
+    .filter_map(|path| parse_session(&path, &providers))
     .collect::<Vec<_>>();
 
   sessions.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
@@ -123,10 +132,11 @@ pub fn load_messages(source_path: &str) -> Result<Vec<CodexSessionMessage>, AppE
   Ok(messages)
 }
 
-pub fn launch_resume(session_id: &str, cwd: Option<&str>) -> Result<(), AppError> {
+pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Option<&str>) -> Result<(), AppError> {
   if session_id.trim().is_empty() || session_id.chars().any(|ch| ch.is_control()) {
     return Err(AppError::Message("invalid Codex session id".into()));
   }
+  let model_provider_key = validate_model_provider_key(model_provider_key)?;
 
   #[cfg(target_os = "windows")]
   {
@@ -134,7 +144,11 @@ pub fn launch_resume(session_id: &str, cwd: Option<&str>) -> Result<(), AppError
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 
     let mut command = std::process::Command::new("cmd");
-    command.args(["/K", "codex", "resume", session_id]);
+    command.args(["/K", "codex", "resume"]);
+    if let Some(provider) = model_provider_key {
+      command.args(["-c", &format!("model_provider={provider}")]);
+    }
+    command.arg(session_id);
     command.creation_flags(CREATE_NEW_CONSOLE);
     if let Some(cwd) = cwd.and_then(existing_dir) {
       command.current_dir(cwd);
@@ -145,15 +159,17 @@ pub fn launch_resume(session_id: &str, cwd: Option<&str>) -> Result<(), AppError
 
   #[cfg(not(target_os = "windows"))]
   {
-    let _ = cwd;
+    let _ = (cwd, model_provider_key);
     Err(AppError::Message("terminal launch is only implemented on Windows; copy the resume command instead".into()))
   }
 }
 
 pub fn repair_visibility(requests: &[CodexSessionVisibilityRepairRequest]) -> Vec<CodexSessionVisibilityRepairOutcome> {
+  let providers = load_model_provider_lookup();
+  let visible_provider = providers.active_name.as_deref().unwrap_or(DEFAULT_MODEL_PROVIDER);
   requests
     .iter()
-    .map(|request| match repair_session_visibility(&request.session_id, &request.source_path) {
+    .map(|request| match repair_session_visibility(&request.session_id, &request.source_path, visible_provider, &providers) {
       Ok(changed) => CodexSessionVisibilityRepairOutcome {
         session_id: request.session_id.clone(),
         source_path: request.source_path.clone(),
@@ -172,13 +188,13 @@ pub fn repair_visibility(requests: &[CodexSessionVisibilityRepairRequest]) -> Ve
     .collect()
 }
 
-fn repair_session_visibility(session_id: &str, source_path: &str) -> Result<bool, AppError> {
+fn repair_session_visibility(session_id: &str, source_path: &str, visible_provider: &str, providers: &ModelProviderLookup) -> Result<bool, AppError> {
   if session_id.trim().is_empty() || session_id.chars().any(|ch| ch.is_control()) {
     return Err(AppError::Message("invalid Codex session id".into()));
   }
 
   let path = validate_session_source(source_path)?;
-  let meta = parse_session(&path).ok_or_else(|| AppError::Message("failed to parse Codex session metadata".into()))?;
+  let meta = parse_session(&path, providers).ok_or_else(|| AppError::Message("failed to parse Codex session metadata".into()))?;
   if meta.session_id != session_id {
     return Err(AppError::Message(format!("Codex session ID mismatch: expected {session_id}, found {}", meta.session_id)));
   }
@@ -218,14 +234,14 @@ fn repair_session_visibility(session_id: &str, source_path: &str) -> Result<bool
     let provider_matches = payload
       .get("model_provider")
       .and_then(Value::as_str)
-      .map(|value| value == VISIBLE_MODEL_PROVIDER)
+      .map(|value| value == visible_provider)
       .unwrap_or(false);
     if provider_matches {
       next_lines.push(line.to_string());
       continue;
     }
 
-    payload.insert("model_provider".to_string(), Value::String(VISIBLE_MODEL_PROVIDER.to_string()));
+    payload.insert("model_provider".to_string(), Value::String(visible_provider.to_string()));
     let serialized = serde_json::to_string(&value).map_err(|err| AppError::Message(err.to_string()))?;
     next_lines.push(serialized);
     changed = true;
@@ -254,6 +270,48 @@ fn codex_dir() -> PathBuf {
   std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| path_for("codex", ""))
 }
 
+fn load_model_provider_lookup() -> ModelProviderLookup {
+  let path = codex_dir().join("config.toml");
+  let Ok(content) = fs::read_to_string(path) else { return ModelProviderLookup::default(); };
+  let Ok(config) = toml::from_str::<toml::Value>(&content) else { return ModelProviderLookup::default(); };
+  let active_key = config.get("model_provider").and_then(toml::Value::as_str);
+  let mut lookup = ModelProviderLookup::default();
+  if let Some(key) = active_key {
+    lookup.aliases.insert(key.to_ascii_lowercase(), key.to_string());
+  }
+
+  if let Some(providers) = config.get("model_providers").and_then(toml::Value::as_table) {
+    for (key, value) in providers {
+      lookup.aliases.insert(key.to_ascii_lowercase(), key.clone());
+      if let Some(name) = value.get("name").and_then(toml::Value::as_str) {
+        lookup.aliases.insert(name.to_ascii_lowercase(), key.clone());
+      }
+    }
+    lookup.active_name = active_key.and_then(|key| {
+      providers
+        .get(key)
+        .and_then(|value| value.get("name"))
+        .and_then(toml::Value::as_str)
+        .or(Some(key))
+        .map(str::to_string)
+    });
+  }
+  if lookup.active_name.is_none() {
+    lookup.active_name = active_key.map(str::to_string);
+  }
+
+  lookup
+}
+
+fn validate_model_provider_key(value: Option<&str>) -> Result<Option<&str>, AppError> {
+  let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else { return Ok(None); };
+  if value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')) {
+    Ok(Some(value))
+  } else {
+    Err(AppError::Message("invalid Codex model provider key".into()))
+  }
+}
+
 fn session_roots() -> Vec<PathBuf> {
   let dir = codex_dir();
   vec![dir.join("sessions"), dir.join("archived_sessions")]
@@ -276,11 +334,12 @@ fn validate_session_source(source_path: &str) -> Result<PathBuf, AppError> {
   Err(AppError::Message("session file is outside Codex session directories".into()))
 }
 
-fn parse_session(path: &Path) -> Option<CodexSessionMeta> {
+fn parse_session(path: &Path, providers: &ModelProviderLookup) -> Option<CodexSessionMeta> {
   let (head, tail) = read_head_tail_lines(path, 40, 80).ok()?;
   let mut session_id = None;
   let mut project_dir = None;
   let mut created_at = None;
+  let mut model_provider = None;
   let mut first_user_message = None;
 
   for line in &head {
@@ -295,6 +354,7 @@ fn parse_session(path: &Path) -> Option<CodexSessionMeta> {
         }
         session_id = session_id.or_else(|| payload.get("id").and_then(Value::as_str).map(str::to_string));
         project_dir = project_dir.or_else(|| payload.get("cwd").and_then(Value::as_str).map(str::to_string));
+        model_provider = model_provider.or_else(|| payload.get("model_provider").and_then(Value::as_str).map(str::to_string));
       }
     }
     if first_user_message.is_none() && value.get("type").and_then(Value::as_str) == Some("response_item") {
@@ -336,6 +396,13 @@ fn parse_session(path: &Path) -> Option<CodexSessionMeta> {
   let modified_at = modified_at_ms(path).unwrap_or(0);
   let source_path = path.to_string_lossy().to_string();
   let archived = source_path.contains("archived_sessions");
+  let model_provider_key = model_provider
+    .as_deref()
+    .and_then(|provider| providers.aliases.get(&provider.to_ascii_lowercase()).cloned().or_else(|| validate_model_provider_key(Some(provider)).ok().flatten().map(str::to_string)));
+  let resume_command = match model_provider_key.as_deref() {
+    Some(provider) => format!("codex resume -c model_provider={provider} {session_id}"),
+    None => format!("codex resume {session_id}"),
+  };
 
   Some(CodexSessionMeta {
     session_id: session_id.clone(),
@@ -344,8 +411,10 @@ fn parse_session(path: &Path) -> Option<CodexSessionMeta> {
     project_dir,
     created_at,
     last_active_at,
+    model_provider,
+    model_provider_key,
     source_path,
-    resume_command: format!("codex resume {session_id}"),
+    resume_command,
     archived,
     modified_at,
   })
@@ -539,6 +608,31 @@ mod tests {
   }
 
   #[test]
+  fn maps_recorded_provider_names_to_resume_config_keys() {
+    with_codex_home(|root| {
+      fs::write(
+        root.join("config.toml"),
+        "model_provider = \"ai8888\"\n[model_providers.ai8888]\nname = \"AI8888\"\n[model_providers.custom]\nname = \"Custom Provider\"\n",
+      )
+      .expect("write config");
+      let active = root.join("sessions");
+      fs::create_dir_all(&active).expect("active dir");
+      fs::write(active.join("ai8888.jsonl"), "{\"type\":\"session_meta\",\"payload\":{\"id\":\"ai8888-id\",\"model_provider\":\"AI8888\"}}\n").expect("write AI8888 session");
+      fs::write(active.join("custom.jsonl"), "{\"type\":\"session_meta\",\"payload\":{\"id\":\"custom-id\",\"model_provider\":\"custom\"}}\n").expect("write custom session");
+
+      let sessions = scan_sessions();
+      let ai8888 = sessions.iter().find(|session| session.session_id == "ai8888-id").expect("AI8888 session");
+      assert_eq!(ai8888.model_provider.as_deref(), Some("AI8888"));
+      assert_eq!(ai8888.model_provider_key.as_deref(), Some("ai8888"));
+      assert_eq!(ai8888.resume_command, "codex resume -c model_provider=ai8888 ai8888-id");
+
+      let custom = sessions.iter().find(|session| session.session_id == "custom-id").expect("custom session");
+      assert_eq!(custom.model_provider_key.as_deref(), Some("custom"));
+      assert_eq!(custom.resume_command, "codex resume -c model_provider=custom custom-id");
+    });
+  }
+
+  #[test]
   fn rejects_message_load_outside_codex_roots() {
     with_codex_home(|_| {
       let outside = std::env::temp_dir().join(format!("outside-{}.jsonl", now_ms()));
@@ -568,6 +662,27 @@ mod tests {
       let content = fs::read_to_string(&source).expect("read repaired session");
       assert!(content.contains("\"model_provider\":\"ai8888\""));
       assert!(!content.contains("\"model_provider\":\"openai\""));
+    });
+  }
+
+  #[test]
+  fn repairs_visibility_to_active_provider_display_name() {
+    with_codex_home(|root| {
+      fs::write(root.join("config.toml"), "model_provider = \"ai8888\"\n[model_providers.ai8888]\nname = \"AI8888\"\n").expect("write config");
+      let active = root.join("sessions");
+      fs::create_dir_all(&active).expect("active dir");
+      let source = active.join("session.jsonl");
+      fs::write(&source, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"repair-name-id\",\"model_provider\":\"custom\"}}\n").expect("write session");
+
+      let outcomes = repair_visibility(&[CodexSessionVisibilityRepairRequest {
+        session_id: "repair-name-id".into(),
+        source_path: source.to_string_lossy().to_string(),
+      }]);
+
+      assert!(outcomes[0].success);
+      assert!(outcomes[0].changed);
+      let content = fs::read_to_string(source).expect("read repaired session");
+      assert!(content.contains("\"model_provider\":\"AI8888\""));
     });
   }
 }
