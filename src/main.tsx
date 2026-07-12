@@ -427,7 +427,34 @@ function CodexSessionsApp() {
 
   async function refreshLocalState() { const next = await invoke<AppStateData>("app_get_state"); setState({ ...defaultState, ...next }); }
   async function refreshLocalRouteManifest() { try { const [next, statuses] = await Promise.all([invoke<LocalRouteManifest>("app_get_local_route_manifest").catch(() => null), invoke<LocalRouteStatus[]>("app_get_local_route_statuses")]); setLocalRouteManifest(next); setLocalRouteStatuses(statuses); } catch { setLocalRouteManifest(null); setLocalRouteStatuses([]); } }
-  async function refreshRemote() { const next = await run(() => invoke<AppStateData>("app_load_remote_state"), "已刷新余额、订阅与 Key"); if (next) setState({ ...defaultState, ...next }); }
+  const refreshRemote = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
+    try {
+      if (silent) {
+        const next = await invoke<AppStateData>("app_load_remote_state");
+        setState({ ...defaultState, ...next });
+      } else {
+        const next = await run(() => invoke<AppStateData>("app_load_remote_state"), "\u5df2\u5237\u65b0\u4f59\u989d\u3001\u8ba2\u9605\u4e0e Key");
+        if (next) setState({ ...defaultState, ...next });
+      }
+    } catch (err) {
+      const text = formatAuthError(err);
+      if (isReloginError(text)) {
+        setState({ ...defaultState });
+        setManualKey("");
+        setModels([]);
+        setSelectedModel("");
+        setModelError(null);
+        setError(text);
+        setMessage("\u8bf7\u91cd\u65b0\u767b\u5f55");
+        return;
+      }
+      if (!silent) {
+        setError(text);
+        setMessage("\u64cd\u4f5c\u5931\u8d25");
+      }
+    }
+  }, []);
   async function chooseTool(tool: string) { const next = await invoke<AppStateData>("app_set_selected_tool", { tool }); setState({ ...defaultState, ...next }); setModels([]); setSelectedModel(""); setModelError(null); }
   async function chooseKey(keyId: number) { const next = await invoke<AppStateData>("app_set_selected_key", { keyId }); setState({ ...defaultState, ...next }); const selectedItem = next.keys.items.find((item) => item.id === keyId); setNewKeyGroupId(keyGroupId(selectedItem)?.toString() ?? ""); setManualKey(selectedItem?.key ?? ""); }
   async function updateKeyGroup(keyId: number, groupId: string) { await run(() => invoke("app_update_key_group", { keyId, groupId: groupId ? Number(groupId) : null }), "已更新 Key 分组"); await refreshLocalState(); }
@@ -473,6 +500,30 @@ function CodexSessionsApp() {
     }, FOUR_HOURS_MS);
     return () => window.clearInterval(timer);
   }, [checkUpdate]);
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
+    // Keep usage/expiry alerts fresh while logged in.
+    void refreshRemote({ silent: true });
+    const timer = window.setInterval(() => {
+      void refreshRemote({ silent: true });
+    }, FIFTEEN_MINUTES_MS);
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        void refreshRemote({ silent: true });
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, [isAuthenticated, refreshRemote]);
+
 
   async function installUpdate() {
     if (!updateInfo?.downloadUrl) {
@@ -611,11 +662,11 @@ function CodexSessionsApp() {
     <main className="shell">
       <section className="hero">
         <div><p className="eyebrow">AI8888 Switch</p><h1>切换 AI8888 API 配置</h1><p className="heroText">同步账户、订阅、分组与 API Key，一键写入 Codex、Claude、OpenCode 等工具。</p></div>
-        <div className="statusCard"><span className="dot ok" /><div><strong>已登录</strong><small>{message}</small><small className="balanceLine">账户余额：{money(state.account?.balance ?? 0)} <button className="ghost mini inlineRefresh" onClick={refreshRemote} disabled={busy}>刷新</button></small><div className="statusActions"><button className="ghost mini statusButton" onClick={openPurchase}>充值续费</button><button className="ghost mini statusButton" onClick={openRadar}>智商雷达</button><button className="ghost mini statusButton" onClick={openModelStatus}>模型监控</button><button className="ghost mini statusButton" onClick={logout} disabled={busy}>退出登录</button></div></div></div>
+        <div className="statusCard"><span className="dot ok" /><div><strong>已登录</strong><small>{message}</small><small className="balanceLine">账户余额：{money(state.account?.balance ?? 0)} <button className="ghost mini inlineRefresh" onClick={() => { void refreshRemote(); }} disabled={busy}>刷新</button></small><div className="statusActions"><button className="ghost mini statusButton" onClick={openPurchase}>充值续费</button><button className="ghost mini statusButton" onClick={openRadar}>智商雷达</button><button className="ghost mini statusButton" onClick={openModelStatus}>模型监控</button><button className="ghost mini statusButton" onClick={logout} disabled={busy}>退出登录</button></div></div></div>
       </section>
       {error && <div className="alert">{error}</div>}{modelError && <div className="alert">{modelError}</div>}
       
-      {accountAlerts.length > 0 && <section className="alertStack">{accountAlerts.slice(0, 4).map((alert) => <article className={"alertCard " + alert.level} key={alert.id}><div><strong>{alert.title}</strong><p>{alert.detail}</p></div><div className="alertActions">{alert.action === "purchase" && <button className="secondary mini" onClick={() => void openPurchase()}>{"\u5145\u503c\u7eed\u8d39"}</button>}{alert.action === "refresh" && <button className="ghost mini" onClick={() => void refreshRemote()} disabled={busy}>{"\u5237\u65b0\u7528\u91cf"}</button>}<button className="ghost mini" onClick={() => void dismissAlert(alert.id)}>{"\u5ffd\u7565"}</button></div></article>)}</section>}
+      {accountAlerts.length > 0 && <section className="alertStack">{accountAlerts.slice(0, 4).map((alert) => <article className={"alertCard " + alert.level} key={alert.id}><div><strong>{alert.title}</strong><p>{alert.detail}</p></div><div className="alertActions">{alert.action === "purchase" && <button className="secondary mini" onClick={() => void openPurchase()}>{"\u5145\u503c\u7eed\u8d39"}</button>}{alert.action === "refresh" && <button className="ghost mini" onClick={() => { void refreshRemote(); }} disabled={busy}>{"\u5237\u65b0\u7528\u91cf"}</button>}<button className="ghost mini" onClick={() => void dismissAlert(alert.id)}>{"\u5ffd\u7565"}</button></div></article>)}</section>}
 
       {showWizard && isAuthenticated && (
         <section className="panel wizardPanel">

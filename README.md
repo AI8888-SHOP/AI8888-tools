@@ -13,7 +13,7 @@ Current version: v0.0.3
 - GitHub Releases based update check from the main window footer.
 - Mainland China download acceleration for GitHub release assets when the exit IP is CN.
 - One-click update download/install from the main window footer.
-- Account usage and subscription expiry alerts with dismiss actions.
+- Account usage and subscription expiry alerts with dismiss actions (auto-refresh every 15 minutes while logged in, plus on window focus).
 - Codex session full-text search with provider/archive filters.
 - First-run setup wizard for endpoint probe, tool/key selection, and config write.
 
