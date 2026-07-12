@@ -37,6 +37,14 @@ pub fn local_route_manifest_path() -> PathBuf {
   app_dir().join("local-routing.json")
 }
 
+pub fn preferences_path() -> PathBuf {
+  app_dir().join("preferences.json")
+}
+
+pub fn updates_dir() -> PathBuf {
+  app_dir().join("updates")
+}
+
 pub fn ensure_app_dir() -> Result<PathBuf, AppError> {
   let dir = app_dir();
   fs::create_dir_all(&dir).map_err(|err| AppError::io(&dir, err))?;

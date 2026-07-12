@@ -12,6 +12,10 @@ Current version: v0.0.3
 - Standalone Codex session manager with browsing, multi-select resume, and session visibility repair.
 - GitHub Releases based update check from the main window footer.
 - Mainland China download acceleration for GitHub release assets when the exit IP is CN.
+- One-click update download/install from the main window footer.
+- Account usage and subscription expiry alerts with dismiss actions.
+- Codex session full-text search with provider/archive filters.
+- First-run setup wizard for endpoint probe, tool/key selection, and config write.
 
 ## Packaging policy
 

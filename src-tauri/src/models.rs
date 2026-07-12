@@ -358,3 +358,23 @@ pub struct UpdateCheckResult {
   pub repository: String,
   pub error: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AppPreferences {
+  #[serde(default)]
+  pub onboarding_completed: bool,
+  #[serde(default)]
+  pub onboarding_step: u32,
+  #[serde(default)]
+  pub dismissed_alert_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInstallResult {
+  pub success: bool,
+  pub installer_path: Option<String>,
+  pub launched: bool,
+  pub message: String,
+}

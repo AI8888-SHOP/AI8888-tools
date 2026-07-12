@@ -9,11 +9,11 @@ mod tools;
 use std::collections::HashMap;
 
 use api::{ApiClient, CreateKeyPayload, LoginPayload, ModelsQuery, RefreshPayload, UpdateKeyPayload};
-use codex_sessions::{CodexSessionMessage, CodexSessionMeta, CodexSessionVisibilityRepairOutcome, CodexSessionVisibilityRepairRequest};
-use config::{ensure_app_dir, local_route_manifest_path, read_json, state_path, write_json, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL};
+use codex_sessions::{CodexSessionMessage, CodexSessionMeta, CodexSessionSearchHit, CodexSessionSearchRequest, CodexSessionVisibilityRepairOutcome, CodexSessionVisibilityRepairRequest};
+use config::{ensure_app_dir, local_route_manifest_path, preferences_path, read_json, state_path, updates_dir, write_json, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL};
 use error::AppError;
 use local_proxy::ensure_local_proxy;
-use models::{AccountSummary, ApiKeySummary, AppStateData, EndpointProbeSummary, GroupSummary, LocalRouteManifest, LocalRouteStatus, LoginResult, ModelSummary, Pagination, StoredSession, SubscriptionSummary, SwitchTarget, ToolProfile, UpdateCheckResult};
+use models::{AccountSummary, ApiKeySummary, AppPreferences, AppStateData, EndpointProbeSummary, GroupSummary, LocalRouteManifest, LocalRouteStatus, LoginResult, ModelSummary, Pagination, StoredSession, SubscriptionSummary, SwitchTarget, ToolProfile, UpdateCheckResult, UpdateInstallResult};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
@@ -138,6 +138,176 @@ async fn app_check_update() -> Result<UpdateCheckResult, String> {
     repository: GITHUB_UPDATE_REPOSITORY.to_string(),
     error: None,
   })
+}
+
+
+fn load_preferences() -> AppPreferences {
+  read_json(&preferences_path()).unwrap_or_default()
+}
+
+fn save_preferences(prefs: &AppPreferences) -> Result<(), AppError> {
+  ensure_app_dir()?;
+  write_json(&preferences_path(), prefs)
+}
+
+#[tauri::command]
+async fn app_get_preferences() -> Result<AppPreferences, String> {
+  Ok(load_preferences())
+}
+
+#[tauri::command]
+async fn app_set_preferences(preferences: AppPreferences) -> Result<AppPreferences, String> {
+  save_preferences(&preferences).map_err(|err| err.to_string())?;
+  Ok(preferences)
+}
+
+#[tauri::command]
+async fn app_complete_onboarding() -> Result<AppPreferences, String> {
+  let mut prefs = load_preferences();
+  prefs.onboarding_completed = true;
+  prefs.onboarding_step = 0;
+  save_preferences(&prefs).map_err(|err| err.to_string())?;
+  Ok(prefs)
+}
+
+#[tauri::command]
+async fn app_dismiss_alert(alert_id: String) -> Result<AppPreferences, String> {
+  let mut prefs = load_preferences();
+  if !alert_id.trim().is_empty() && !prefs.dismissed_alert_ids.iter().any(|item| item == &alert_id) {
+    prefs.dismissed_alert_ids.push(alert_id);
+    // Keep list bounded.
+    if prefs.dismissed_alert_ids.len() > 100 {
+      let overflow = prefs.dismissed_alert_ids.len() - 100;
+      prefs.dismissed_alert_ids.drain(0..overflow);
+    }
+    save_preferences(&prefs).map_err(|err| err.to_string())?;
+  }
+  Ok(prefs)
+}
+
+#[tauri::command]
+async fn app_install_update(download_url: String) -> Result<UpdateInstallResult, String> {
+  let url = download_url.trim().to_string();
+  if url.is_empty() {
+    return Ok(UpdateInstallResult {
+      success: false,
+      installer_path: None,
+      launched: false,
+      message: "缺少下载地址".into(),
+    });
+  }
+  if !(url.starts_with("https://") || url.starts_with("http://")) {
+    return Ok(UpdateInstallResult {
+      success: false,
+      installer_path: None,
+      launched: false,
+      message: "下载地址无效".into(),
+    });
+  }
+
+  ensure_app_dir().map_err(|err| err.to_string())?;
+  let updates = updates_dir();
+  std::fs::create_dir_all(&updates).map_err(|err| err.to_string())?;
+
+  let file_name = url
+    .split('?')
+    .next()
+    .unwrap_or(&url)
+    .rsplit('/')
+    .next()
+    .unwrap_or("ai8888-switch-update.bin")
+    .replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_");
+  let target = updates.join(file_name);
+
+  let client = reqwest::Client::builder()
+    .user_agent("AI8888-tools-update-install")
+    .timeout(std::time::Duration::from_secs(180))
+    .build()
+    .map_err(|err| err.to_string())?;
+  let response = client.get(&url).send().await.map_err(|err| err.to_string())?;
+  if !response.status().is_success() {
+    return Ok(UpdateInstallResult {
+      success: false,
+      installer_path: None,
+      launched: false,
+      message: format!("下载失败: HTTP {}", response.status()),
+    });
+  }
+  let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+  if bytes.len() < 1024 {
+    return Ok(UpdateInstallResult {
+      success: false,
+      installer_path: None,
+      launched: false,
+      message: "下载内容过小，可能不是有效安装包".into(),
+    });
+  }
+  std::fs::write(&target, &bytes).map_err(|err| err.to_string())?;
+
+  let launched = launch_installer(&target)?;
+  Ok(UpdateInstallResult {
+    success: true,
+    installer_path: Some(target.display().to_string()),
+    launched,
+    message: if launched {
+      "已下载并启动安装程序，请按提示完成更新".into()
+    } else {
+      format!("已下载安装包：{}", target.display())
+    },
+  })
+}
+
+fn launch_installer(path: &std::path::Path) -> Result<bool, String> {
+  #[cfg(target_os = "windows")]
+  {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+    let lower = path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+    let mut command = if lower == "msi" {
+      let mut cmd = std::process::Command::new("msiexec");
+      cmd.arg("/i").arg(path);
+      cmd
+    } else {
+      let cmd = std::process::Command::new(path);
+      cmd
+    };
+    command.creation_flags(CREATE_NEW_CONSOLE);
+    match command.spawn() {
+      Ok(_) => Ok(true),
+      Err(err) => Err(format!("安装包启动失败: {err}")),
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  {
+    match std::process::Command::new("open").arg(path).spawn() {
+      Ok(_) => Ok(true),
+      Err(err) => Err(format!("安装包打开失败: {err}")),
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  {
+    // Best effort: open with xdg-open; deb/rpm/AppImage may need manual install.
+    match std::process::Command::new("xdg-open").arg(path).spawn() {
+      Ok(_) => Ok(true),
+      Err(err) => Err(format!("安装包打开失败: {err}")),
+    }
+  }
+
+  #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+  {
+    let _ = path;
+    Ok(false)
+  }
+}
+
+#[tauri::command]
+async fn app_search_codex_sessions(request: CodexSessionSearchRequest) -> Result<Vec<CodexSessionSearchHit>, String> {
+  tauri::async_runtime::spawn_blocking(move || codex_sessions::search_sessions(&request))
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())
 }
 
 const GITHUB_DOWNLOAD_ACCELERATOR_PREFIX: &str = "https://gh.jasonzeng.dev/";
@@ -952,6 +1122,12 @@ pub fn run() {
       app_get_state,
       app_get_tools,
       app_check_update,
+      app_install_update,
+      app_get_preferences,
+      app_set_preferences,
+      app_complete_onboarding,
+      app_dismiss_alert,
+      app_search_codex_sessions,
       app_open_login_window,
       app_open_purchase_window,
       app_open_radar_window,

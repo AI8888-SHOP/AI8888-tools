@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
-import { isActiveSubscription, money, moneyOrDash, percentLabel, quotaLine, subscriptionProgressInfo, usageWindow, type GroupSummary, type SubscriptionProgress, type SubscriptionProgressInfo, type SubscriptionSummary } from "./subscription";
+import { buildAccountAlerts, isActiveSubscription, money, moneyOrDash, percentLabel, quotaLine, subscriptionProgressInfo, usageWindow, type GroupSummary, type SubscriptionProgress, type SubscriptionProgressInfo, type SubscriptionSummary } from "./subscription";
 
 type AccountSummary = { id: number; email: string; username?: string | null; role?: string | null; balance: number; concurrency: number; status: string; runMode?: string | null };
 type ApiKeySummary = { id: number; name: string; key?: string | null; status?: string | null; quota?: number | null; quotaUsed?: number | null; expiresAt?: string | null; groupId?: number | null; group?: GroupSummary | null };
@@ -17,7 +17,10 @@ type LocalRouteStatus = { app: string; detected: boolean; configPath: string; ba
 type EndpointProbeResult = { domain: string; baseUrl: string; attempts: number; successCount: number; packetLoss: number; averageLatencyMs?: number | null; bestLatencyMs?: number | null; selected: boolean; error?: string | null };
 type EndpointProbeSummary = { selectedBaseUrl: string; selectedDomain: string; results: EndpointProbeResult[] };
 type UpdateCheckResult = { currentVersion: string; latestVersion?: string | null; updateAvailable: boolean; releaseUrl?: string | null; downloadUrl?: string | null; downloadAccelerated?: boolean; mainlandChina?: boolean; repository: string; error?: string | null };
+type UpdateInstallResult = { success: boolean; installerPath?: string | null; launched: boolean; message: string };
+type AppPreferences = { onboardingCompleted: boolean; onboardingStep: number; dismissedAlertIds: string[] };
 type CodexSessionMeta = { sessionId: string; title?: string | null; summary?: string | null; projectDir?: string | null; createdAt?: string | null; lastActiveAt?: string | null; modelProvider?: string | null; modelProviderKey?: string | null; sourcePath: string; resumeCommand: string; archived: boolean; modifiedAt: number };
+type CodexSessionSearchHit = { session: CodexSessionMeta; matchedIn: string[]; snippet?: string | null };
 type CodexSessionMessage = { role: string; content: string; timestamp?: string | null };
 type CodexSessionVisibilityRepairOutcome = { sessionId: string; sourcePath: string; success: boolean; changed: boolean; error?: string | null };
 
@@ -112,6 +115,11 @@ function CodexSessionsApp() {
   const [selected, setSelected] = useState<CodexSessionMeta | null>(null);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
   const [query, setQuery] = useState("");
+  const [includeMessages, setIncludeMessages] = useState(true);
+  const [scope, setScope] = useState<"all" | "active" | "archived">("all");
+  const [providerFilter, setProviderFilter] = useState("");
+  const [searchHits, setSearchHits] = useState<CodexSessionSearchHit[] | null>(null);
+  const [searching, setSearching] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState("\u5c31\u7eea");
@@ -158,10 +166,58 @@ function CodexSessionsApp() {
   }
 
   const filtered = useMemo(() => {
+    if (searchHits) return searchHits.map((hit) => hit.session);
+    let list = sessions;
+    if (scope === "active") list = list.filter((session) => !session.archived);
+    if (scope === "archived") list = list.filter((session) => session.archived);
+    const provider = providerFilter.trim().toLowerCase();
+    if (provider) {
+      list = list.filter((session) => [session.modelProvider, session.modelProviderKey].some((value) => (value || "").toLowerCase().includes(provider)));
+    }
     const text = query.trim().toLowerCase();
-    if (!text) return sessions;
-    return sessions.filter((session) => [session.sessionId, session.title, session.summary, session.projectDir, session.modelProvider, session.sourcePath].some((value) => (value || "").toLowerCase().includes(text)));
-  }, [query, sessions]);
+    if (!text) return list;
+    return list.filter((session) => [session.sessionId, session.title, session.summary, session.projectDir, session.modelProvider, session.sourcePath].some((value) => (value || "").toLowerCase().includes(text)));
+  }, [query, sessions, searchHits, scope, providerFilter]);
+
+  const hitMap = useMemo(() => {
+    const map = new Map<string, CodexSessionSearchHit>();
+    (searchHits || []).forEach((hit) => map.set(hit.session.sourcePath, hit));
+    return map;
+  }, [searchHits]);
+
+  async function runSessionSearch() {
+    const text = query.trim();
+    const provider = providerFilter.trim();
+    const needsBackend = includeMessages && text.length > 0;
+    if (!needsBackend) {
+      setSearchHits(null);
+      setMessage(text || provider ? "\u5df2\u6309\u672c\u5730\u6761\u4ef6\u8fc7\u6ee4" : "\u5c55\u793a\u5168\u90e8\u4f1a\u8bdd");
+      return;
+    }
+    setSearching(true); setError(null);
+    try {
+      const hits = await invoke<CodexSessionSearchHit[]>("app_search_codex_sessions", {
+        request: {
+          query: text,
+          includeMessages,
+          archivedOnly: scope === "archived",
+          activeOnly: scope === "active",
+          provider: provider || null,
+          limit: 200,
+        },
+      });
+      setSearchHits(hits);
+      setMessage(`\u641c\u7d22\u5230 ${hits.length} \u4e2a\u4f1a\u8bdd\uff08\u542b\u6d88\u606f\u5168\u6587\uff09`);
+      if (hits[0]) {
+        setSelected(hits[0].session);
+        await loadMessages(hits[0].session);
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSearching(false);
+    }
+  }
 
   const selectedBatch = useMemo(() => sessions.filter((session) => selectedPaths.has(session.sourcePath)), [sessions, selectedPaths]);
   const actionTargets = selectedBatch.length > 0 ? selectedBatch : (selected ? [selected] : []);
@@ -240,8 +296,20 @@ function CodexSessionsApp() {
       {error && <div className="alert">{error}</div>}
       <section className="sessionsGrid">
         <aside className="panel sessionsListPanel">
-          <div className="panelHead"><h2>{"\u4f1a\u8bdd\u5217\u8868"}</h2><button className="ghost mini" onClick={() => loadSessions()} disabled={busy}>{busy ? "\u5904\u7406\u4e2d" : "\u5237\u65b0"}</button></div>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="\u641c\u7d22\u4f1a\u8bdd" />
+          <div className="panelHead"><h2>{"\u4f1a\u8bdd\u5217\u8868"}</h2><button className="ghost mini" onClick={() => { setSearchHits(null); void loadSessions(); }} disabled={busy || searching}>{"\u5237\u65b0"}</button></div>
+          <div className="sessionSearchBox">
+            <input value={query} onChange={(e) => { setQuery(e.target.value); if (!e.target.value.trim()) setSearchHits(null); }} onKeyDown={(e) => { if (e.key === "Enter") void runSessionSearch(); }} placeholder={"\u641c\u7d22\u4f1a\u8bdd ID / \u6807\u9898 / \u9879\u76ee / \u6d88\u606f\u5168\u6587"} />
+            <div className="sessionFilters">
+              <select value={scope} onChange={(e) => { setScope(e.target.value as "all" | "active" | "archived"); setSearchHits(null); }}>
+                <option value="all">{"\u5168\u90e8"}</option>
+                <option value="active">{"\u8fdb\u884c\u4e2d"}</option>
+                <option value="archived">{"\u5df2\u5f52\u6863"}</option>
+              </select>
+              <input value={providerFilter} onChange={(e) => { setProviderFilter(e.target.value); setSearchHits(null); }} placeholder="provider" />
+              <label className="checkboxLine compact"><input type="checkbox" checked={includeMessages} onChange={(e) => setIncludeMessages(e.target.checked)} />{"\u6d88\u606f\u5168\u6587"}</label>
+              <button className="secondary mini" onClick={() => void runSessionSearch()} disabled={busy || searching}>{searching ? "\u641c\u7d22\u4e2d" : "\u641c\u7d22"}</button>
+            </div>
+          </div>
           <div className="batchBar">
             <span>{"\u5df2\u9009 "}{selectedBatch.length}</span>
             <button className="ghost mini" onClick={toggleFilteredSelection} disabled={filtered.length === 0}>{allFilteredSelected ? "\u53d6\u6d88\u5f53\u524d" : "\u5168\u9009\u5f53\u524d"}</button>
@@ -252,9 +320,16 @@ function CodexSessionsApp() {
             {filtered.length === 0 && <p className="muted">{"\u672a\u627e\u5230 Codex \u4f1a\u8bdd\u3002"}</p>}
             {filtered.map((session) => {
               const checked = selectedPaths.has(session.sourcePath);
+              const hit = hitMap.get(session.sourcePath);
               return <article className={"sessionItem " + (selected?.sourcePath === session.sourcePath ? "selected " : "") + (checked ? "checked" : "")} key={session.sourcePath} onClick={() => setSelected(session)}>
                 <input aria-label="\u9009\u62e9\u4f1a\u8bdd" type="checkbox" checked={checked} onChange={(event) => toggleSelection(session, event.target.checked)} onClick={(event) => event.stopPropagation()} />
-                <div><strong>{sessionTitle(session)}</strong><small>{displayTime(session.lastActiveAt ?? session.createdAt)}{session.modelProvider ? ` - ${session.modelProvider}` : ""}{session.archived ? " - \u5df2\u5f52\u6863" : ""}</small><small>{session.projectDir || session.sessionId}</small></div>
+                <div>
+                  <strong>{sessionTitle(session)}</strong>
+                  <small>{displayTime(session.lastActiveAt ?? session.createdAt)}{session.modelProvider ? ` - ${session.modelProvider}` : ""}{session.archived ? " - \u5df2\u5f52\u6863" : ""}</small>
+                  <small>{session.projectDir || session.sessionId}</small>
+                  {hit?.matchedIn?.length ? <small className="matchTags">{"\u5339\u914d"}: {hit.matchedIn.join(", ")}</small> : null}
+                  {hit?.snippet ? <small className="matchSnippet">{hit.snippet}</small> : null}
+                </div>
               </article>;
             })}
           </div>
@@ -293,7 +368,10 @@ function CodexSessionsApp() {
   const [endpointProbe, setEndpointProbe] = useState<EndpointProbeSummary | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [preferences, setPreferences] = useState<AppPreferences>({ onboardingCompleted: true, onboardingStep: 0, dismissedAlertIds: [] });
+  const [showWizard, setShowWizard] = useState(false);
   const [routeCodexEnabled, setRouteCodexEnabled] = useState(false);
   const [routeClaudeEnabled, setRouteClaudeEnabled] = useState(false);
   const [routeOpenCodeEnabled, setRouteOpenCodeEnabled] = useState(false);
@@ -305,6 +383,12 @@ function CodexSessionsApp() {
 
   const selectedTool = useMemo(() => tools.find((tool) => tool.tool === state.selectedTool) ?? tools[0], [state.selectedTool, tools]);
   const selectedKey = useMemo(() => state.keys.items.find((key) => key.id === state.selectedKeyId) ?? state.keys.items[0], [state.keys.items, state.selectedKeyId]);
+  const accountAlerts = useMemo(() => {
+    const all = buildAccountAlerts({ balance: state.account?.balance, subscriptions: state.subscriptions, subscriptionProgress: state.subscriptionProgress });
+    const dismissed = new Set(preferences.dismissedAlertIds || []);
+    return all.filter((alert) => !dismissed.has(alert.id));
+  }, [state.account?.balance, state.subscriptions, state.subscriptionProgress, preferences.dismissedAlertIds]);
+
   const isAuthenticated = Boolean(state.session);
   const effectiveKey = manualKey.trim() || selectedKey?.key || "";
   const modelChoice = selectedModel.trim();
@@ -349,7 +433,7 @@ function CodexSessionsApp() {
   async function updateKeyGroup(keyId: number, groupId: string) { await run(() => invoke("app_update_key_group", { keyId, groupId: groupId ? Number(groupId) : null }), "已更新 Key 分组"); await refreshLocalState(); }
   async function createKey() { const created = await run(() => invoke<ApiKeySummary>("app_create_key", { payload: { name: newKeyName, groupId: newKeyGroupId ? Number(newKeyGroupId) : null } }), "API Key 已创建"); if (created?.key) setManualKey(created.key); await refreshLocalState(); }
   async function deleteKey(keyId: number) { await run(() => invoke("app_delete_key", { keyId }), "API Key 已删除"); await refreshLocalState(); }
-  async function login() { const next = await run(() => invoke<AppStateData>("app_login_with_password", { email, password }), "登录成功"); if (next) { setState({ ...defaultState, ...next }); setPassword(""); await refreshLocalRouteManifest(); } }
+  async function login() { const next = await run(() => invoke<AppStateData>("app_login_with_password", { email, password }), "登录成功"); if (next) { setState({ ...defaultState, ...next }); setPassword(""); await refreshLocalRouteManifest(); if (!preferences.onboardingCompleted) setShowWizard(true); } }
   async function logout() { const next = await run(() => invoke<AppStateData>("app_logout"), "已退出登录"); if (next) { setState({ ...defaultState, ...next }); setManualKey(""); setModels([]); setSelectedModel(""); setModelError(null); } }
   async function openPurchase() { await run(() => invoke("app_open_purchase_window"), "已打开充值续费页面"); }
   async function openRadar() { await run(() => invoke("app_open_radar_window"), "已打开智商雷达"); }
@@ -389,6 +473,54 @@ function CodexSessionsApp() {
     }, FOUR_HOURS_MS);
     return () => window.clearInterval(timer);
   }, [checkUpdate]);
+
+  async function installUpdate() {
+    if (!updateInfo?.downloadUrl) {
+      setMessage("\u6ca1\u6709\u53ef\u5b89\u88c5\u7684\u4e0b\u8f7d\u5730\u5740");
+      return;
+    }
+    setInstallingUpdate(true); setError(null);
+    try {
+      const result = await invoke<UpdateInstallResult>("app_install_update", { downloadUrl: updateInfo.downloadUrl });
+      if (result.success) setMessage(result.message);
+      else setError(result.message || "\u5b89\u88c5\u5931\u8d25");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setInstallingUpdate(false);
+    }
+  }
+
+  async function dismissAlert(alertId: string) {
+    try {
+      const next = await invoke<AppPreferences>("app_dismiss_alert", { alertId });
+      setPreferences(next);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function completeOnboarding() {
+    try {
+      const next = await invoke<AppPreferences>("app_complete_onboarding");
+      setPreferences(next);
+      setShowWizard(false);
+      setMessage("\u9996\u6b21\u5f15\u5bfc\u5df2\u5b8c\u6210");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function saveOnboardingStep(step: number) {
+    const next = { ...preferences, onboardingCompleted: false, onboardingStep: step, dismissedAlertIds: preferences.dismissedAlertIds || [] };
+    setPreferences(next);
+    try {
+      const saved = await invoke<AppPreferences>("app_set_preferences", { preferences: next });
+      setPreferences(saved);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
 
   async function testModels() {
     setTestingModels(true); setModelError(null);
@@ -430,13 +562,16 @@ function CodexSessionsApp() {
 
   useEffect(() => { void (async () => {
     try {
-      const [nextState, nextTools, nextEndpoint, nextManifest, nextStatuses] = await Promise.all([
+      const [nextState, nextTools, nextEndpoint, nextManifest, nextStatuses, nextPrefs] = await Promise.all([
         invoke<AppStateData>("app_get_state"),
         invoke<ToolProfile[]>("app_get_tools"),
         invoke<EndpointProbeSummary>("app_get_endpoint").catch(() => null),
         invoke<LocalRouteManifest>("app_get_local_route_manifest").catch(() => null),
         invoke<LocalRouteStatus[]>("app_get_local_route_statuses").catch(() => []),
+        invoke<AppPreferences>("app_get_preferences").catch(() => ({ onboardingCompleted: false, onboardingStep: 0, dismissedAlertIds: [] })),
       ]);
+      setPreferences(nextPrefs || { onboardingCompleted: false, onboardingStep: 0, dismissedAlertIds: [] });
+      setShowWizard(!(nextPrefs?.onboardingCompleted));
       setTools(nextTools);
       if (nextEndpoint) {
         setEndpointProbe(nextEndpoint);
@@ -479,6 +614,60 @@ function CodexSessionsApp() {
         <div className="statusCard"><span className="dot ok" /><div><strong>已登录</strong><small>{message}</small><small className="balanceLine">账户余额：{money(state.account?.balance ?? 0)} <button className="ghost mini inlineRefresh" onClick={refreshRemote} disabled={busy}>刷新</button></small><div className="statusActions"><button className="ghost mini statusButton" onClick={openPurchase}>充值续费</button><button className="ghost mini statusButton" onClick={openRadar}>智商雷达</button><button className="ghost mini statusButton" onClick={openModelStatus}>模型监控</button><button className="ghost mini statusButton" onClick={logout} disabled={busy}>退出登录</button></div></div></div>
       </section>
       {error && <div className="alert">{error}</div>}{modelError && <div className="alert">{modelError}</div>}
+      
+      {accountAlerts.length > 0 && <section className="alertStack">{accountAlerts.slice(0, 4).map((alert) => <article className={"alertCard " + alert.level} key={alert.id}><div><strong>{alert.title}</strong><p>{alert.detail}</p></div><div className="alertActions">{alert.action === "purchase" && <button className="secondary mini" onClick={() => void openPurchase()}>{"\u5145\u503c\u7eed\u8d39"}</button>}{alert.action === "refresh" && <button className="ghost mini" onClick={() => void refreshRemote()} disabled={busy}>{"\u5237\u65b0\u7528\u91cf"}</button>}<button className="ghost mini" onClick={() => void dismissAlert(alert.id)}>{"\u5ffd\u7565"}</button></div></article>)}</section>}
+
+      {showWizard && isAuthenticated && (
+        <section className="panel wizardPanel">
+          <div className="panelHead">
+            <h2>{"首次引导"}</h2>
+            <span className="badge">{"步骤 "}{(preferences.onboardingStep || 0) + 1}/4</span>
+          </div>
+          <div className="wizardBody">
+            {(preferences.onboardingStep || 0) <= 0 && (
+              <div>
+                <strong>{"欢迎使用 AI8888 Switch"}</strong>
+                <p className="muted">{"我们会帮你完成：检测端点 → 选择工具与 Key → 写入配置 → 完成。"}</p>
+              </div>
+            )}
+            {(preferences.onboardingStep || 0) === 1 && (
+              <div>
+                <strong>{"检测可用端点"}</strong>
+                <p className="muted">{"点击下方按钮，自动选择延迟最低的 AI8888 域名。"}</p>
+                <div className="actions">
+                  <button onClick={() => void probeBestEndpoint()} disabled={probingEndpoint}>{probingEndpoint ? "检测中" : "开始检测"}</button>
+                </div>
+                {endpointProbe && <p className="muted">{"当前端点："}{endpointProbe.selectedDomain}</p>}
+              </div>
+            )}
+            {(preferences.onboardingStep || 0) === 2 && (
+              <div>
+                <strong>{"选择工具与 API Key"}</strong>
+                <p className="muted">{"在下方面板选择目标工具，并选中或创建 API Key。"}</p>
+                <p className="muted">{"当前工具："}{selectedTool?.displayName || state.selectedTool}{" ，Key："}{selectedKey?.name || (manualKey ? "手动 Key" : "未选择")}</p>
+              </div>
+            )}
+            {(preferences.onboardingStep || 0) >= 3 && (
+              <div>
+                <strong>{"写入配置并完成"}</strong>
+                <p className="muted">{"确认 Base URL、Key 与模型后，点击“写入配置”。也可先跳过，后续再写入。"}</p>
+              </div>
+            )}
+          </div>
+          <div className="actions wizardActions">
+            <button className="ghost" onClick={() => void completeOnboarding()}>{"跳过引导"}</button>
+            {(preferences.onboardingStep || 0) > 0 && (
+              <button className="ghost" onClick={() => void saveOnboardingStep(Math.max(0, (preferences.onboardingStep || 0) - 1))}>{"上一步"}</button>
+            )}
+            {(preferences.onboardingStep || 0) < 3 ? (
+              <button onClick={() => void saveOnboardingStep(Math.min(3, (preferences.onboardingStep || 0) + 1))}>{"下一步"}</button>
+            ) : (
+              <button onClick={() => void completeOnboarding()}>{"完成"}</button>
+            )}
+          </div>
+        </section>
+      )}
+
       <section className="panel quickActions"><div><h2>{"Codex \u4f1a\u8bdd\u7ba1\u7406"}</h2><p className="muted">{"\u6253\u5f00\u72ec\u7acb\u7a97\u53e3\u6d4f\u89c8\u672c\u5730 Codex \u4f1a\u8bdd\uff0c\u5e76\u6062\u590d\u9009\u4e2d\u7684\u5bf9\u8bdd\u3002"}</p></div><button onClick={openCodexSessions}>{"\u6253\u5f00\u4f1a\u8bdd\u7ba1\u7406"}</button></section>
 
       <section className="grid two">

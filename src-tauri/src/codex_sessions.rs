@@ -48,6 +48,34 @@ pub struct CodexSessionMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CodexSessionSearchRequest {
+  #[serde(default)]
+  pub query: String,
+  #[serde(default = "default_true")]
+  pub include_messages: bool,
+  #[serde(default)]
+  pub archived_only: bool,
+  #[serde(default)]
+  pub active_only: bool,
+  #[serde(default)]
+  pub provider: Option<String>,
+  #[serde(default = "default_search_limit")]
+  pub limit: u32,
+}
+
+fn default_true() -> bool { true }
+fn default_search_limit() -> u32 { 200 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionSearchHit {
+  pub session: CodexSessionMeta,
+  pub matched_in: Vec<String>,
+  pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CodexSessionVisibilityRepairRequest {
   pub session_id: String,
   pub source_path: String,
@@ -131,6 +159,132 @@ pub fn load_messages(source_path: &str) -> Result<Vec<CodexSessionMessage>, AppE
   }
 
   Ok(messages)
+}
+
+pub fn search_sessions(request: &CodexSessionSearchRequest) -> Result<Vec<CodexSessionSearchHit>, AppError> {
+  let query = request.query.trim().to_ascii_lowercase();
+  let provider_filter = request
+    .provider
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(|value| value.to_ascii_lowercase());
+  let limit = if request.limit == 0 { 200 } else { request.limit.min(500) as usize };
+  let sessions = scan_sessions();
+  let mut hits = Vec::new();
+
+  for session in sessions {
+    if request.archived_only && !session.archived {
+      continue;
+    }
+    if request.active_only && session.archived {
+      continue;
+    }
+    if let Some(provider) = provider_filter.as_deref() {
+      let provider_text = format!(
+        "{} {}",
+        session.model_provider.clone().unwrap_or_default(),
+        session.model_provider_key.clone().unwrap_or_default()
+      )
+      .to_ascii_lowercase();
+      if !provider_text.contains(provider) {
+        continue;
+      }
+    }
+
+    let mut matched_in = Vec::new();
+    let mut snippet = None;
+
+    if query.is_empty() {
+      matched_in.push("all".into());
+    } else {
+      let meta_fields = [
+        ("id", session.session_id.as_str()),
+        ("title", session.title.as_deref().unwrap_or("")),
+        ("summary", session.summary.as_deref().unwrap_or("")),
+        ("project", session.project_dir.as_deref().unwrap_or("")),
+        ("provider", session.model_provider.as_deref().unwrap_or("")),
+        ("path", session.source_path.as_str()),
+      ];
+      for (label, value) in meta_fields {
+        if value.to_ascii_lowercase().contains(&query) {
+          matched_in.push(label.into());
+          if snippet.is_none() {
+            snippet = Some(truncate_snippet(value, &query));
+          }
+        }
+      }
+
+      if request.include_messages && matched_in.is_empty() {
+        if let Ok(messages) = load_messages(&session.source_path) {
+          for message in messages {
+            if message.content.to_ascii_lowercase().contains(&query) {
+              matched_in.push(format!("message:{}", message.role));
+              snippet = Some(truncate_snippet(&message.content, &query));
+              break;
+            }
+          }
+        }
+      } else if request.include_messages {
+        // still try to enrich snippet with first message hit when metadata already matched
+        if snippet.is_none() {
+          if let Ok(messages) = load_messages(&session.source_path) {
+            for message in messages {
+              if message.content.to_ascii_lowercase().contains(&query) {
+                if !matched_in.iter().any(|item| item.starts_with("message:")) {
+                  matched_in.push(format!("message:{}", message.role));
+                }
+                snippet = Some(truncate_snippet(&message.content, &query));
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      if matched_in.is_empty() {
+        continue;
+      }
+    }
+
+    hits.push(CodexSessionSearchHit {
+      session,
+      matched_in,
+      snippet,
+    });
+    if hits.len() >= limit {
+      break;
+    }
+  }
+
+  Ok(hits)
+}
+
+fn truncate_snippet(text: &str, query: &str) -> String {
+  let lower = text.to_ascii_lowercase();
+  let query_lower = query.to_ascii_lowercase();
+  let bytes = text.as_bytes();
+  if query_lower.is_empty() {
+    return text.chars().take(160).collect();
+  }
+  let pos = lower.find(&query_lower).unwrap_or(0);
+  let start = pos.saturating_sub(40);
+  let end = (pos + query_lower.len() + 80).min(text.len());
+  // align to char boundaries roughly by using chars collect from byte-safe slice attempt
+  let slice = match text.get(start..end) {
+    Some(value) => value,
+    None => return text.chars().take(160).collect(),
+  };
+  let mut out = String::new();
+  if start > 0 {
+    out.push_str("...");
+  }
+  out.push_str(slice.trim());
+  if end < text.len() {
+    out.push_str("...");
+  }
+  let _ = bytes;
+  out
 }
 
 pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Option<&str>) -> Result<(), AppError> {
@@ -761,5 +915,27 @@ mod tests {
       assert!(!content.contains("\"model_provider\":\"AI8888\""));
     });
   }
+
+  #[test]
+  fn searches_session_message_content() {
+    with_codex_home(|root| {
+      let active = root.join("sessions");
+      fs::create_dir_all(&active).expect("active dir");
+      let source = active.join("a.jsonl");
+      fs::write(&source, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"search-id\",\"cwd\":\"D:/code/app\",\"model_provider\":\"ai8888\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"please fix login token refresh bug\"}}\n").expect("write");
+      let hits = search_sessions(&CodexSessionSearchRequest {
+        query: "token refresh".into(),
+        include_messages: true,
+        archived_only: false,
+        active_only: false,
+        provider: None,
+        limit: 20,
+      }).expect("search");
+      let hit = hits.iter().find(|hit| hit.session.session_id == "search-id").expect("search hit");
+      assert!(hit.matched_in.iter().any(|item| item == "title" || item == "summary" || item.starts_with("message:")));
+      assert!(hit.snippet.as_deref().unwrap_or("").to_ascii_lowercase().contains("token refresh"));
+    });
+  }
+
 
 }
