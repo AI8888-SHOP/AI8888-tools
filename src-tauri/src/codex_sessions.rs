@@ -312,23 +312,102 @@ pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Op
     Ok(())
   }
 
-  #[cfg(not(target_os = "windows"))]
+  #[cfg(target_os = "macos")]
   {
-    let mut command = std::process::Command::new("codex");
-    command.arg("resume");
+    let mut resume = String::from("codex resume");
     if let Some(provider) = model_provider_key {
-      command.args(["-c", &format!("model_provider={provider}")]);
+      resume.push_str(&format!(" -c model_provider={provider}"));
     }
-    command.arg(session_id);
-    if let Some(cwd) = cwd.and_then(existing_dir) {
+    resume.push(' ');
+    resume.push_str(session_id);
+
+    // Escape for embedding inside an AppleScript double-quoted string.
+    let escape_as = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut shell = resume;
+    shell.push_str("; echo; echo \"[AI8888] resume finished. Press Enter to close.\"; read");
+    let shell = escape_as(&shell);
+
+    let script = if let Some(cwd) = cwd.and_then(existing_dir) {
+      let cwd_str = escape_as(&cwd.display().to_string());
+      format!("tell application \"Terminal\" to do script \"cd \\\"{cwd_str}\\\"; {shell}\"")
+    } else {
+      format!("tell application \"Terminal\" to do script \"{shell}\"")
+    };
+
+    match std::process::Command::new("osascript").args(["-e", &script]).spawn() {
+      Ok(_) => Ok(()),
+      Err(err) => Err(AppError::Message(format!(
+        "failed to launch Codex resume on macOS ({err}). Copy and run the resume command manually instead."
+      ))),
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  {
+    let mut args = vec!["resume".to_string()];
+    if let Some(provider) = model_provider_key {
+      args.push("-c".into());
+      args.push(format!("model_provider={provider}"));
+    }
+    args.push(session_id.to_string());
+    let cwd_path = cwd.and_then(existing_dir);
+    let candidates: [(&str, Vec<String>); 5] = [
+      ("x-terminal-emulator", {
+        let mut v = vec!["-e".into(), "codex".into()];
+        v.extend(args.clone());
+        v
+      }),
+      ("gnome-terminal", {
+        let mut v = vec!["--".into(), "codex".into()];
+        v.extend(args.clone());
+        v
+      }),
+      ("konsole", {
+        let mut v = vec!["-e".into(), "codex".into()];
+        v.extend(args.clone());
+        v
+      }),
+      ("xfce4-terminal", {
+        let mut v = vec!["-e".into(), "codex".into()];
+        v.extend(args.clone());
+        v
+      }),
+      ("xterm", {
+        let mut v = vec!["-e".into(), "codex".into()];
+        v.extend(args.clone());
+        v
+      }),
+    ];
+    let mut last_err = None;
+    for (bin, bin_args) in candidates {
+      let mut command = std::process::Command::new(bin);
+      command.args(&bin_args);
+      if let Some(cwd) = cwd_path.as_ref() {
+        command.current_dir(cwd);
+      }
+      match command.spawn() {
+        Ok(_) => return Ok(()),
+        Err(err) => last_err = Some(format!("{bin}: {err}")),
+      }
+    }
+    // Final fallback: spawn codex directly (may be headless depending on desktop session).
+    let mut command = std::process::Command::new("codex");
+    command.args(&args);
+    if let Some(cwd) = cwd_path.as_ref() {
       command.current_dir(cwd);
     }
     match command.spawn() {
       Ok(_) => Ok(()),
       Err(err) => Err(AppError::Message(format!(
-        "failed to launch Codex resume on this platform ({err}). Copy and run the resume command manually instead."
+        "failed to launch Codex resume on Linux ({}). Copy and run the resume command manually instead.",
+        last_err.unwrap_or_else(|| err.to_string())
       ))),
     }
+  }
+
+  #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+  {
+    Err(AppError::Message("terminal launch is not supported on this platform; copy the resume command instead".into()))
   }
 }
 

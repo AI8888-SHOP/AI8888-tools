@@ -20,7 +20,7 @@ use tauri::{Manager, State};
 use tokio::sync::RwLock;
 use tools::{build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
 
-const CURRENT_APP_VERSION: &str = "v0.0.3";
+const CURRENT_APP_VERSION: &str = "v0.0.4";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
@@ -454,7 +454,7 @@ mod update_download_tests {
 
   #[test]
   fn accelerates_github_download_url() {
-    let original = "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.3/AI8888.Switch_0.0.3_x64-setup.exe";
+    let original = "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.4/AI8888.Switch_0.0.4_x64-setup.exe";
     let accelerated = accelerate_github_download_url(original);
     assert_eq!(accelerated, format!("{GITHUB_DOWNLOAD_ACCELERATOR_PREFIX}{original}"));
     assert_eq!(accelerate_github_download_url(&accelerated), accelerated);
@@ -464,12 +464,12 @@ mod update_download_tests {
   fn scores_current_platform_installers_positive() {
     // At least one common installer type should score > 0 on every desktop OS build.
     let samples = [
-      "ai8888-switch_0.0.3_x64-setup.exe",
-      "AI8888 Switch_0.0.3_x64_en-US.msi",
-      "AI8888.Switch_0.0.3_x64.dmg",
-      "ai8888-switch_0.0.3_amd64.AppImage",
-      "ai8888-switch_0.0.3_amd64.deb",
-      "ai8888-switch-0.0.3-1.x86_64.rpm",
+      "ai8888-switch_0.0.4_x64-setup.exe",
+      "AI8888 Switch_0.0.4_x64_en-US.msi",
+      "AI8888.Switch_0.0.4_x64.dmg",
+      "ai8888-switch_0.0.4_amd64.AppImage",
+      "ai8888-switch_0.0.4_amd64.deb",
+      "ai8888-switch-0.0.4-1.x86_64.rpm",
     ];
     assert!(samples.iter().any(|name| score_release_asset(&name.to_ascii_lowercase()) > 50));
   }

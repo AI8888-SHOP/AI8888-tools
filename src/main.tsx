@@ -85,7 +85,7 @@ function AuthGate(props: { email: string; password: string; setEmail: (v: string
           <button onClick={props.onLogin} disabled={props.busy || !props.email || !props.password}>登录</button>
         </div>
       </section>
-      <footer className="appFooter">v0.0.3 Copyright AI8888.SHOP 2026</footer>
+      <footer className="appFooter">v0.0.4 Copyright AI8888.SHOP 2026</footer>
     </main>
   );
 }
@@ -747,7 +747,7 @@ function CodexSessionsApp() {
       {preview.length > 0 && <section className="panel"><div className="panelHead"><h2>写入目标</h2></div><div className="list">{preview.map(([path, label]) => <article className="row" key={path}><div><strong>{label}</strong><small>{path}</small></div></article>)}</div></section>}
       {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
             <footer className="appFooter">
-        <div>v0.0.3 Copyright AI8888.SHOP 2026</div>
+        <div>v0.0.4 Copyright AI8888.SHOP 2026</div>
         <div className="footerActions"><button className="ghost mini" onClick={() => { void checkUpdate(); }} disabled={checkingUpdate}>{checkingUpdate ? "检查中" : "检查更新"}</button>{(updateInfo?.downloadUrl || updateInfo?.releaseUrl) && <a href={updateInfo.downloadUrl || updateInfo.releaseUrl || "#"} target="_blank" rel="noreferrer">{updateInfo.updateAvailable ? (updateInfo.downloadUrl ? (updateInfo.downloadAccelerated ? "加速下载新版本" : "下载新版本") : "查看新版本") : "GitHub Releases"}</a>}{updateInfo?.updateAvailable && updateInfo?.releaseUrl && updateInfo?.downloadUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">发布页</a>}</div>
         {updateInfo && <div className="muted">{updateInfo.updateAvailable ? `发现新版本 ${updateInfo.latestVersion}${updateInfo.downloadAccelerated ? "（已启用 GitHub 加速下载）" : updateInfo.mainlandChina ? "（大陆网络，未找到安装包资源）" : ""}` : updateInfo.error ? `更新检查失败：${updateInfo.error}` : `当前已是最新版本 ${updateInfo.currentVersion}`}</div>}
         <div className="credits">{"\u81f4\u8c22\u5f00\u6e90\u9879\u76ee\uff1a"}<a href="https://github.com/jlcodes99/cockpit-tools" target="_blank" rel="noreferrer">cockpit-tools</a><a href="https://github.com/jlcodes99/cc-switch" target="_blank" rel="noreferrer">cc-switch</a><a href="https://github.com/Wei-Shaw/sub2api" target="_blank" rel="noreferrer">sub2api</a></div>
