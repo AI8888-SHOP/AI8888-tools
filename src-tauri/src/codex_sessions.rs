@@ -160,8 +160,21 @@ pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Op
 
   #[cfg(not(target_os = "windows"))]
   {
-    let _ = (cwd, model_provider_key);
-    Err(AppError::Message("terminal launch is only implemented on Windows; copy the resume command instead".into()))
+    let mut command = std::process::Command::new("codex");
+    command.arg("resume");
+    if let Some(provider) = model_provider_key {
+      command.args(["-c", &format!("model_provider={provider}")]);
+    }
+    command.arg(session_id);
+    if let Some(cwd) = cwd.and_then(existing_dir) {
+      command.current_dir(cwd);
+    }
+    match command.spawn() {
+      Ok(_) => Ok(()),
+      Err(err) => Err(AppError::Message(format!(
+        "failed to launch Codex resume on this platform ({err}). Copy and run the resume command manually instead."
+      ))),
+    }
   }
 }
 

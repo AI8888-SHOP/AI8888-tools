@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
@@ -16,7 +16,7 @@ type LocalRouteManifest = { profileName: string; updatedAt: number; entries: Loc
 type LocalRouteStatus = { app: string; detected: boolean; configPath: string; baseUrlMatched: boolean; proxyKeyMatched: boolean; oauthPreserved?: boolean; mcpPreserved?: boolean; detail: string };
 type EndpointProbeResult = { domain: string; baseUrl: string; attempts: number; successCount: number; packetLoss: number; averageLatencyMs?: number | null; bestLatencyMs?: number | null; selected: boolean; error?: string | null };
 type EndpointProbeSummary = { selectedBaseUrl: string; selectedDomain: string; results: EndpointProbeResult[] };
-type UpdateCheckResult = { currentVersion: string; latestVersion?: string | null; updateAvailable: boolean; releaseUrl?: string | null; repository: string; error?: string | null };
+type UpdateCheckResult = { currentVersion: string; latestVersion?: string | null; updateAvailable: boolean; releaseUrl?: string | null; downloadUrl?: string | null; downloadAccelerated?: boolean; mainlandChina?: boolean; repository: string; error?: string | null };
 type CodexSessionMeta = { sessionId: string; title?: string | null; summary?: string | null; projectDir?: string | null; createdAt?: string | null; lastActiveAt?: string | null; modelProvider?: string | null; modelProviderKey?: string | null; sourcePath: string; resumeCommand: string; archived: boolean; modifiedAt: number };
 type CodexSessionMessage = { role: string; content: string; timestamp?: string | null };
 type CodexSessionVisibilityRepairOutcome = { sessionId: string; sourcePath: string; success: boolean; changed: boolean; error?: string | null };
@@ -357,24 +357,38 @@ function CodexSessionsApp() {
 
   async function openCodexSessions() { await run(() => invoke("app_open_codex_sessions_window"), "\u5df2\u6253\u5f00 Codex \u4f1a\u8bdd\u7ba1\u7406"); }
 
-  async function checkUpdate() {
-    setCheckingUpdate(true); setError(null);
+    const checkUpdate = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
+    setCheckingUpdate(true);
+    if (!silent) setError(null);
     try {
       const result = await invoke<UpdateCheckResult>("app_check_update");
       setUpdateInfo(result);
       if (result.error) {
-        setMessage(`\u68c0\u67e5\u66f4\u65b0\u5931\u8d25\uff1a${result.error}`);
+        if (!silent) setMessage(`更新检查失败：${result.error}`);
       } else if (result.updateAvailable) {
-        setMessage(`\u53d1\u73b0\u65b0\u7248\u672c ${result.latestVersion}`);
-      } else {
-        setMessage(`\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c ${result.currentVersion}`);
+        setMessage(result.downloadAccelerated
+          ? `发现新版本 ${result.latestVersion}，已切换 GitHub 加速下载`
+          : `发现新版本 ${result.latestVersion}`);
+      } else if (!silent) {
+        setMessage(`当前已是最新版本 ${result.currentVersion}`);
       }
     } catch (err) {
-      setError(String(err));
+      if (!silent) setError(String(err));
     } finally {
       setCheckingUpdate(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+    // Auto-check once on every app open.
+    void checkUpdate({ silent: true });
+    const timer = window.setInterval(() => {
+      void checkUpdate({ silent: true });
+    }, FOUR_HOURS_MS);
+    return () => window.clearInterval(timer);
+  }, [checkUpdate]);
 
   async function testModels() {
     setTestingModels(true); setModelError(null);
@@ -494,8 +508,8 @@ function CodexSessionsApp() {
       {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
             <footer className="appFooter">
         <div>v0.0.3 Copyright AI8888.SHOP 2026</div>
-        <div className="footerActions"><button className="ghost mini" onClick={checkUpdate} disabled={checkingUpdate}>{checkingUpdate ? "\u68c0\u67e5\u4e2d" : "\u68c0\u67e5\u66f4\u65b0"}</button>{updateInfo?.releaseUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">{updateInfo.updateAvailable ? "\u67e5\u770b\u65b0\u7248\u672c" : "GitHub Releases"}</a>}</div>
-        {updateInfo && <div className="muted">{updateInfo.updateAvailable ? `\u53d1\u73b0\u65b0\u7248\u672c ${updateInfo.latestVersion}` : updateInfo.error ? `\u66f4\u65b0\u68c0\u67e5\u5931\u8d25\uff1a${updateInfo.error}` : `\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c ${updateInfo.currentVersion}`}</div>}
+        <div className="footerActions"><button className="ghost mini" onClick={() => { void checkUpdate(); }} disabled={checkingUpdate}>{checkingUpdate ? "检查中" : "检查更新"}</button>{(updateInfo?.downloadUrl || updateInfo?.releaseUrl) && <a href={updateInfo.downloadUrl || updateInfo.releaseUrl || "#"} target="_blank" rel="noreferrer">{updateInfo.updateAvailable ? (updateInfo.downloadUrl ? (updateInfo.downloadAccelerated ? "加速下载新版本" : "下载新版本") : "查看新版本") : "GitHub Releases"}</a>}{updateInfo?.updateAvailable && updateInfo?.releaseUrl && updateInfo?.downloadUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">发布页</a>}</div>
+        {updateInfo && <div className="muted">{updateInfo.updateAvailable ? `发现新版本 ${updateInfo.latestVersion}${updateInfo.downloadAccelerated ? "（已启用 GitHub 加速下载）" : updateInfo.mainlandChina ? "（大陆网络，未找到安装包资源）" : ""}` : updateInfo.error ? `更新检查失败：${updateInfo.error}` : `当前已是最新版本 ${updateInfo.currentVersion}`}</div>}
         <div className="credits">{"\u81f4\u8c22\u5f00\u6e90\u9879\u76ee\uff1a"}<a href="https://github.com/jlcodes99/cockpit-tools" target="_blank" rel="noreferrer">cockpit-tools</a><a href="https://github.com/jlcodes99/cc-switch" target="_blank" rel="noreferrer">cc-switch</a><a href="https://github.com/Wei-Shaw/sub2api" target="_blank" rel="noreferrer">sub2api</a></div>
       </footer>
     </main>

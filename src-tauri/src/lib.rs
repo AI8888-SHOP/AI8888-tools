@@ -64,8 +64,13 @@ async fn app_get_tools() -> Result<Vec<ToolProfile>, String> {
 
 #[tauri::command]
 async fn app_check_update() -> Result<UpdateCheckResult, String> {
+  let mainland_china = detect_mainland_china_exit_ip().await;
   let url = format!("https://api.github.com/repos/{GITHUB_UPDATE_REPOSITORY}/releases/latest");
-  let client = reqwest::Client::builder().user_agent("AI8888-tools-update-check").build().map_err(|err| err.to_string())?;
+  let client = reqwest::Client::builder()
+    .user_agent("AI8888-tools-update-check")
+    .build()
+    .map_err(|err| err.to_string())?;
+
   let response = match client.get(&url).send().await {
     Ok(response) => response,
     Err(err) => {
@@ -74,6 +79,9 @@ async fn app_check_update() -> Result<UpdateCheckResult, String> {
         latest_version: None,
         update_available: false,
         release_url: Some(format!("https://github.com/{GITHUB_UPDATE_REPOSITORY}/releases")),
+        download_url: None,
+        download_accelerated: false,
+        mainland_china,
         repository: GITHUB_UPDATE_REPOSITORY.to_string(),
         error: Some(err.to_string()),
       });
@@ -88,6 +96,9 @@ async fn app_check_update() -> Result<UpdateCheckResult, String> {
       latest_version: None,
       update_available: false,
       release_url: Some(format!("https://github.com/{GITHUB_UPDATE_REPOSITORY}/releases")),
+      download_url: None,
+      download_accelerated: false,
+      mainland_china,
       repository: GITHUB_UPDATE_REPOSITORY.to_string(),
       error: Some(format!("GitHub releases returned {status}: {}", text.chars().take(200).collect::<String>())),
     });
@@ -100,16 +111,246 @@ async fn app_check_update() -> Result<UpdateCheckResult, String> {
     .and_then(serde_json::Value::as_str)
     .map(str::to_string)
     .or_else(|| Some(format!("https://github.com/{GITHUB_UPDATE_REPOSITORY}/releases")));
-  let update_available = latest_version.as_deref().map(|version| compare_versions(version, CURRENT_APP_VERSION).is_gt()).unwrap_or(false);
+  let update_available = latest_version
+    .as_deref()
+    .map(|version| compare_versions(version, CURRENT_APP_VERSION).is_gt())
+    .unwrap_or(false);
+
+  let original_download = select_release_download_url(&value);
+  let (download_url, download_accelerated) = if update_available {
+    match original_download {
+      Some(url) if mainland_china => (Some(accelerate_github_download_url(&url)), true),
+      Some(url) => (Some(url), false),
+      None => (None, false),
+    }
+  } else {
+    (None, false)
+  };
 
   Ok(UpdateCheckResult {
     current_version: CURRENT_APP_VERSION.to_string(),
     latest_version,
     update_available,
     release_url,
+    download_url,
+    download_accelerated,
+    mainland_china,
     repository: GITHUB_UPDATE_REPOSITORY.to_string(),
     error: None,
   })
+}
+
+const GITHUB_DOWNLOAD_ACCELERATOR_PREFIX: &str = "https://gh.jasonzeng.dev/";
+
+fn accelerate_github_download_url(url: &str) -> String {
+  let trimmed = url.trim();
+  if trimmed.is_empty() {
+    return String::new();
+  }
+  if trimmed.starts_with(GITHUB_DOWNLOAD_ACCELERATOR_PREFIX) {
+    return trimmed.to_string();
+  }
+  format!("{GITHUB_DOWNLOAD_ACCELERATOR_PREFIX}{trimmed}")
+}
+
+fn select_release_download_url(release: &serde_json::Value) -> Option<String> {
+  let assets = release.get("assets").and_then(serde_json::Value::as_array)?;
+  let mut candidates = Vec::new();
+  for asset in assets {
+    let name = asset.get("name").and_then(serde_json::Value::as_str).unwrap_or("").to_ascii_lowercase();
+    let url = asset
+      .get("browser_download_url")
+      .and_then(serde_json::Value::as_str)
+      .unwrap_or("")
+      .to_string();
+    if url.is_empty() {
+      continue;
+    }
+    let score = score_release_asset(&name);
+    if score > 0 {
+      candidates.push((score, url));
+    }
+  }
+  candidates.sort_by(|left, right| right.0.cmp(&left.0));
+  candidates.into_iter().map(|(_, url)| url).next()
+}
+
+fn current_os_family() -> &'static str {
+  if cfg!(target_os = "windows") {
+    "windows"
+  } else if cfg!(target_os = "macos") {
+    "macos"
+  } else if cfg!(target_os = "linux") {
+    "linux"
+  } else {
+    "other"
+  }
+}
+
+fn score_release_asset(name: &str) -> i32 {
+  // Prefer installers for the current desktop OS; still allow cross-platform assets as fallback.
+  let os = current_os_family();
+  let mut score = 0;
+
+  let is_windows = name.ends_with(".msi")
+    || name.ends_with("-setup.exe")
+    || name.ends_with("setup.exe")
+    || name.ends_with(".exe");
+  let is_macos = name.ends_with(".dmg") || name.ends_with(".pkg") || name.ends_with(".app.tar.gz");
+  let is_linux = name.ends_with(".appimage")
+    || name.ends_with(".deb")
+    || name.ends_with(".rpm")
+    || name.ends_with(".tar.gz")
+    || name.ends_with(".tgz");
+
+  match os {
+    "windows" => {
+      if name.ends_with(".msi") {
+        score += 120;
+      } else if name.ends_with("-setup.exe") || name.ends_with("setup.exe") {
+        score += 115;
+      } else if name.ends_with(".exe") {
+        score += 100;
+      } else if is_macos || is_linux {
+        score += 10; // keep as last-resort fallback
+      } else {
+        return 0;
+      }
+    }
+    "macos" => {
+      if name.ends_with(".dmg") {
+        score += 120;
+      } else if name.ends_with(".pkg") {
+        score += 110;
+      } else if name.ends_with(".app.tar.gz") {
+        score += 100;
+      } else if is_windows || is_linux {
+        score += 10;
+      } else {
+        return 0;
+      }
+    }
+    "linux" => {
+      if name.ends_with(".appimage") {
+        score += 120;
+      } else if name.ends_with(".deb") {
+        score += 110;
+      } else if name.ends_with(".rpm") {
+        score += 105;
+      } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        score += 90;
+      } else if is_windows || is_macos {
+        score += 10;
+      } else {
+        return 0;
+      }
+    }
+    _ => {
+      if is_windows || is_macos || is_linux {
+        score += 20;
+      } else {
+        return 0;
+      }
+    }
+  }
+
+  // Architecture preference.
+  let host_arch = std::env::consts::ARCH;
+  if host_arch == "x86_64" && (name.contains("x64") || name.contains("amd64") || name.contains("x86_64") || name.contains("win64")) {
+    score += 20;
+  }
+  if host_arch == "aarch64" && (name.contains("arm64") || name.contains("aarch64")) {
+    score += 20;
+  }
+  // Mild penalty for mismatched arch markers.
+  if host_arch == "x86_64" && (name.contains("arm64") || name.contains("aarch64")) {
+    score -= 25;
+  }
+  if host_arch == "aarch64" && (name.contains("x64") || name.contains("amd64") || name.contains("x86_64")) && !name.contains("universal") {
+    score -= 25;
+  }
+  if name.contains("universal") {
+    score += 15;
+  }
+  if name.contains("ai8888") || name.contains("switch") {
+    score += 5;
+  }
+  score
+}
+
+#[cfg(test)]
+mod update_download_tests {
+  use super::{accelerate_github_download_url, score_release_asset, GITHUB_DOWNLOAD_ACCELERATOR_PREFIX};
+
+  #[test]
+  fn accelerates_github_download_url() {
+    let original = "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.3/AI8888.Switch_0.0.3_x64-setup.exe";
+    let accelerated = accelerate_github_download_url(original);
+    assert_eq!(accelerated, format!("{GITHUB_DOWNLOAD_ACCELERATOR_PREFIX}{original}"));
+    assert_eq!(accelerate_github_download_url(&accelerated), accelerated);
+  }
+
+  #[test]
+  fn scores_current_platform_installers_positive() {
+    // At least one common installer type should score > 0 on every desktop OS build.
+    let samples = [
+      "ai8888-switch_0.0.3_x64-setup.exe",
+      "AI8888 Switch_0.0.3_x64_en-US.msi",
+      "AI8888.Switch_0.0.3_x64.dmg",
+      "ai8888-switch_0.0.3_amd64.AppImage",
+      "ai8888-switch_0.0.3_amd64.deb",
+      "ai8888-switch-0.0.3-1.x86_64.rpm",
+    ];
+    assert!(samples.iter().any(|name| score_release_asset(&name.to_ascii_lowercase()) > 50));
+  }
+}
+
+async fn detect_mainland_china_exit_ip() -> bool {
+  let client = match reqwest::Client::builder()
+    .user_agent("AI8888-tools-update-check")
+    .timeout(std::time::Duration::from_secs(4))
+    .build()
+  {
+    Ok(client) => client,
+    Err(_) => return false,
+  };
+
+  // Prefer lightweight public endpoints; treat country code CN as mainland China.
+  let endpoints = [
+    "https://ipapi.co/country_code/",
+    "https://ipinfo.io/country",
+    "https://api.country.is/",
+  ];
+
+  for endpoint in endpoints {
+    if let Ok(response) = client.get(endpoint).send().await {
+      if !response.status().is_success() {
+        continue;
+      }
+      if let Ok(body) = response.text().await {
+        if country_code_is_mainland_china(&body) {
+          return true;
+        }
+        // api.country.is returns JSON: {"ip":"...","country":"CN"}
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+          if let Some(code) = value.get("country").and_then(serde_json::Value::as_str) {
+            if country_code_is_mainland_china(code) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+fn country_code_is_mainland_china(value: &str) -> bool {
+  value
+    .chars()
+    .filter(|ch| ch.is_ascii_alphabetic())
+    .collect::<String>()
+    .eq_ignore_ascii_case("CN")
 }
 
 fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {

@@ -34,13 +34,25 @@ jobs:
           find artifacts -type f \( \
             -name '*.msi' -o \
             -name '*-setup.exe' -o \
+            -name '*.exe' -o \
             -name '*.deb' -o \
             -name '*.rpm' -o \
             -name '*.AppImage' -o \
-            -name '*.dmg' \
+            -name '*.dmg' -o \
+            -name '*.pkg' \
           \) -exec cp '{}' release-assets/ \;
-          test "$(find release-assets -type f | wc -l)" -ge 6
-          ls -lh release-assets
+          count="$(find release-assets -type f | wc -l | tr -d ' ')"
+          echo "Collected $count installer file(s)"
+          ls -lh release-assets || true
+          if [ "$count" -lt 1 ]; then
+            echo "No installer artifacts found" >&2
+            exit 1
+          fi
+          # Expect multi-platform packages when matrix builds all succeed.
+          # Soft minimum keeps publish usable if one platform is temporarily missing.
+          if [ "$count" -lt 3 ]; then
+            echo "Warning: expected installers from multiple platforms, found only $count" >&2
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

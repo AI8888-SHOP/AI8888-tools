@@ -352,6 +352,9 @@ pub struct UpdateCheckResult {
   pub latest_version: Option<String>,
   pub update_available: bool,
   pub release_url: Option<String>,
+  pub download_url: Option<String>,
+  pub download_accelerated: bool,
+  pub mainland_china: bool,
   pub repository: String,
   pub error: Option<String>,
 }
