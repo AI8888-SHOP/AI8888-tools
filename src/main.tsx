@@ -36,6 +36,26 @@ function endpointProbeText(result: EndpointProbeResult) {
   return `${result.domain}：丢包 ${loss}，平均延迟 ${avg}`;
 }
 
+
+function isReloginError(text: string) {
+  const value = (text || "").toLowerCase();
+  return value.includes("无法获取账号信息")
+    || value.includes("请重新登录")
+    || value.includes("not logged in")
+    || value.includes("missing refresh token")
+    || value.includes("unauthorized")
+    || value.includes("unauthenticated")
+    || value.includes("invalid token")
+    || value.includes("token expired")
+    || value.includes("401")
+    || value.includes("403");
+}
+
+function formatAuthError(err: unknown) {
+  const text = err instanceof Error ? err.message : String(err);
+  return isReloginError(text) ? "无法获取账号信息，请重新登录" : text;
+}
+
 function AuthGate(props: { email: string; password: string; setEmail: (v: string) => void; setPassword: (v: string) => void; busy: boolean; message: string; error: string | null; onLogin: () => void; onOpenPurchase: () => void; onOpenRadar: () => void; onOpenModelStatus: () => void }) {
   return (
     <main className="shell authShell">
@@ -62,7 +82,7 @@ function AuthGate(props: { email: string; password: string; setEmail: (v: string
           <button onClick={props.onLogin} disabled={props.busy || !props.email || !props.password}>登录</button>
         </div>
       </section>
-      <footer className="appFooter">v0.0.2 Copyright AI8888.SHOP 2026</footer>
+      <footer className="appFooter">v0.0.3 Copyright AI8888.SHOP 2026</footer>
     </main>
   );
 }
@@ -300,9 +320,25 @@ function CodexSessionsApp() {
 
   async function run<T>(action: () => Promise<T>, okMessage: string) {
     setBusy(true); setError(null);
-    try { const result = await action(); setMessage(okMessage); return result; }
-    catch (err) { const text = err instanceof Error ? err.message : String(err); setError(text); setMessage("操作失败"); throw err; }
-    finally { setBusy(false); }
+    try {
+      const result = await action();
+      setMessage(okMessage);
+      return result;
+    } catch (err) {
+      const text = formatAuthError(err);
+      setError(text);
+      setMessage(isReloginError(text) ? "请重新登录" : "操作失败");
+      if (isReloginError(text)) {
+        setState({ ...defaultState });
+        setManualKey("");
+        setModels([]);
+        setSelectedModel("");
+        setModelError(null);
+      }
+      throw err;
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function refreshLocalState() { const next = await invoke<AppStateData>("app_get_state"); setState({ ...defaultState, ...next }); }
@@ -378,7 +414,45 @@ function CodexSessionsApp() {
   function updateLocalRouteModel(role: string, value: string) { setLocalRouteModelMap((current) => ({ ...current, [role]: value })); }
   function fillLocalRouteModels() { if (!modelChoice) return; setLocalRouteModelMap({ sonnet: modelChoice, opus: modelChoice, haiku: modelChoice }); }
 
-  useEffect(() => { void (async () => { try { const [nextState, nextTools, nextEndpoint, nextManifest, nextStatuses] = await Promise.all([invoke<AppStateData>("app_get_state"), invoke<ToolProfile[]>("app_get_tools"), invoke<EndpointProbeSummary>("app_get_endpoint").catch(() => null), invoke<LocalRouteManifest>("app_get_local_route_manifest").catch(() => null), invoke<LocalRouteStatus[]>("app_get_local_route_statuses").catch(() => [])]); setState({ ...defaultState, ...nextState }); setTools(nextTools); if (nextEndpoint) { setEndpointProbe(nextEndpoint); setBaseUrl(nextEndpoint.selectedBaseUrl); setMessage(`\u5df2\u9009\u62e9\u53ef\u7528\u7aef\u70b9 ${nextEndpoint.selectedDomain}`); } setLocalRouteManifest(nextManifest); setLocalRouteStatuses(nextStatuses); setNewKeyGroupId(nextState.keys.items[0]?.group?.id?.toString() ?? ""); } catch (err) { setError(String(err)); } })(); }, []);
+  useEffect(() => { void (async () => {
+    try {
+      const [nextState, nextTools, nextEndpoint, nextManifest, nextStatuses] = await Promise.all([
+        invoke<AppStateData>("app_get_state"),
+        invoke<ToolProfile[]>("app_get_tools"),
+        invoke<EndpointProbeSummary>("app_get_endpoint").catch(() => null),
+        invoke<LocalRouteManifest>("app_get_local_route_manifest").catch(() => null),
+        invoke<LocalRouteStatus[]>("app_get_local_route_statuses").catch(() => []),
+      ]);
+      setTools(nextTools);
+      if (nextEndpoint) {
+        setEndpointProbe(nextEndpoint);
+        setBaseUrl(nextEndpoint.selectedBaseUrl);
+        setMessage(`已选择可用端点 ${nextEndpoint.selectedDomain}`);
+      }
+      setLocalRouteManifest(nextManifest);
+      setLocalRouteStatuses(nextStatuses);
+
+      if (nextState.session) {
+        try {
+          // Account info is required; subscription expiry alone should not force re-login.
+          const remote = await invoke<AppStateData>("app_load_remote_state");
+          setState({ ...defaultState, ...remote });
+          setNewKeyGroupId(remote.keys.items[0]?.group?.id?.toString() ?? "");
+          setError(null);
+        } catch (err) {
+          const text = formatAuthError(err);
+          setState({ ...defaultState });
+          setError(text);
+          setMessage(isReloginError(text) ? "请重新登录" : "操作失败");
+        }
+      } else {
+        setState({ ...defaultState, ...nextState });
+        setNewKeyGroupId(nextState.keys.items[0]?.group?.id?.toString() ?? "");
+      }
+    } catch (err) {
+      setError(formatAuthError(err));
+    }
+  })(); }, []);
   useEffect(() => { setSelectedModel((current) => current && models.some((item) => item.id === current) ? current : (models[0]?.id ?? current)); }, [models]);
   useEffect(() => { if (selectedKey) setEditKeyGroupId((current) => ({ ...current, [selectedKey.id]: keyGroupId(selectedKey)?.toString() ?? "" })); }, [selectedKey]);
 
@@ -419,7 +493,7 @@ function CodexSessionsApp() {
       {preview.length > 0 && <section className="panel"><div className="panelHead"><h2>写入目标</h2></div><div className="list">{preview.map(([path, label]) => <article className="row" key={path}><div><strong>{label}</strong><small>{path}</small></div></article>)}</div></section>}
       {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
             <footer className="appFooter">
-        <div>v0.0.2 Copyright AI8888.SHOP 2026</div>
+        <div>v0.0.3 Copyright AI8888.SHOP 2026</div>
         <div className="footerActions"><button className="ghost mini" onClick={checkUpdate} disabled={checkingUpdate}>{checkingUpdate ? "\u68c0\u67e5\u4e2d" : "\u68c0\u67e5\u66f4\u65b0"}</button>{updateInfo?.releaseUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">{updateInfo.updateAvailable ? "\u67e5\u770b\u65b0\u7248\u672c" : "GitHub Releases"}</a>}</div>
         {updateInfo && <div className="muted">{updateInfo.updateAvailable ? `\u53d1\u73b0\u65b0\u7248\u672c ${updateInfo.latestVersion}` : updateInfo.error ? `\u66f4\u65b0\u68c0\u67e5\u5931\u8d25\uff1a${updateInfo.error}` : `\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c ${updateInfo.currentVersion}`}</div>}
         <div className="credits">{"\u81f4\u8c22\u5f00\u6e90\u9879\u76ee\uff1a"}<a href="https://github.com/jlcodes99/cockpit-tools" target="_blank" rel="noreferrer">cockpit-tools</a><a href="https://github.com/jlcodes99/cc-switch" target="_blank" rel="noreferrer">cc-switch</a><a href="https://github.com/Wei-Shaw/sub2api" target="_blank" rel="noreferrer">sub2api</a></div>

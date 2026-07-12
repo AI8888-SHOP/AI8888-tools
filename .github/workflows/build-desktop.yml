@@ -54,6 +54,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ai8888-switch-v0.0.2-${{ matrix.artifact }}
+          name: ai8888-switch-v0.0.3-${{ matrix.artifact }}
           path: ${{ matrix.bundle_path }}
           if-no-files-found: error

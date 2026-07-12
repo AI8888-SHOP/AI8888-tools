@@ -20,7 +20,7 @@ use tauri::{Manager, State};
 use tokio::sync::RwLock;
 use tools::{build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
 
-const CURRENT_APP_VERSION: &str = "v0.0.2";
+const CURRENT_APP_VERSION: &str = "v0.0.3";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
@@ -260,6 +260,48 @@ async fn app_login_with_password(
   apply_login_result(&state, result).await.map_err(|err| err.to_string())
 }
 
+
+fn clear_auth_state(data: &mut AppStateData) {
+  let selected_tool = data.selected_tool.clone();
+  *data = AppStateData {
+    selected_tool,
+    ..Default::default()
+  };
+}
+
+fn requires_relogin(error: &str) -> bool {
+  let lower = error.to_ascii_lowercase();
+  error.contains("无法获取账号信息")
+    || lower.contains("not logged in")
+    || lower.contains("missing refresh token")
+    || lower.contains("please login again")
+    || lower.contains("please re-login")
+    || lower.contains("unauthorized")
+    || lower.contains("unauthenticated")
+    || lower.contains("invalid token")
+    || lower.contains("token expired")
+    || lower.contains("jwt")
+    || lower.contains("401")
+    || lower.contains("403")
+}
+
+fn relogin_error(error: impl ToString) -> String {
+  let text = error.to_string();
+  if requires_relogin(&text) {
+    "无法获取账号信息，请重新登录".into()
+  } else {
+    text
+  }
+}
+
+async fn clear_auth_and_persist(state: &State<'_, SharedState>, message: &str) -> Result<AppStateData, String> {
+  let mut guard = state.data.write().await;
+  clear_auth_state(&mut guard);
+  guard.last_error = Some(message.to_string());
+  persist_state(&guard).map_err(|err| err.to_string())?;
+  Ok(guard.clone())
+}
+
 #[tauri::command]
 async fn app_refresh_session(state: State<'_, SharedState>) -> Result<AppStateData, String> {
   let session = {
@@ -267,16 +309,40 @@ async fn app_refresh_session(state: State<'_, SharedState>) -> Result<AppStateDa
     guard.session.clone().ok_or_else(|| "not logged in".to_string())?
   };
   if session.refresh_token.is_empty() {
-    return Err("missing refresh token, please login again".into());
+    let message = "无法获取账号信息，请重新登录";
+    let _ = clear_auth_and_persist(&state, message).await?;
+    return Err(message.into());
   }
 
-  let refreshed = state
+  let refreshed = match state
     .api
     .refresh(&RefreshPayload { refresh_token: session.refresh_token })
     .await
-    .map_err(|err| err.to_string())?;
-  let account = state.api.get_account(&refreshed.access_token).await.unwrap_or_default();
-  apply_login_result(&state, LoginResult { session: refreshed, account }).await.map_err(|err| err.to_string())
+  {
+    Ok(value) => value,
+    Err(err) => {
+      let message = relogin_error(err);
+      if requires_relogin(&message) {
+        let _ = clear_auth_and_persist(&state, &message).await?;
+      }
+      return Err(message);
+    }
+  };
+
+  let account = match state.api.get_account(&refreshed.access_token).await {
+    Ok(value) => value,
+    Err(err) => {
+      let message = relogin_error(err);
+      if requires_relogin(&message) {
+        let _ = clear_auth_and_persist(&state, &message).await?;
+      }
+      return Err(message);
+    }
+  };
+
+  apply_login_result(&state, LoginResult { session: refreshed, account })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 async fn apply_login_result(state: &State<'_, SharedState>, result: LoginResult) -> Result<AppStateData, AppError> {
@@ -379,12 +445,25 @@ async fn app_load_remote_state(state: State<'_, SharedState>) -> Result<AppState
     let guard = state.data.read().await;
     guard.session.as_ref().map(|session| session.access_token.clone()).ok_or_else(|| "not logged in".to_string())?
   };
-  let account = state.api.get_account(&token).await.map_err(|err| err.to_string())?;
-  let profile = state.api.get_profile(&token).await.unwrap_or_default();
-  let subscriptions = state.api.get_subscriptions(&token).await.map_err(|err| err.to_string())?;
+
+  // Account info is required for a valid session. Subscription expiry is informational only
+  // and must not force re-login.
+  let account = match state.api.get_account(&token).await {
+    Ok(value) => value,
+    Err(err) => {
+      let message = relogin_error(err);
+      if requires_relogin(&message) {
+        let _ = clear_auth_and_persist(&state, &message).await?;
+      }
+      return Err(message);
+    }
+  };
+
+  let profile = state.api.get_profile(&token).await.unwrap_or_else(|_| account.clone());
+  let subscriptions = state.api.get_subscriptions(&token).await.unwrap_or_default();
   let subscription_progress = state.api.get_subscription_progress(&token).await.unwrap_or_default();
   let api_groups = state.api.get_groups(&token).await.unwrap_or_default();
-  let keys = state.api.get_keys(&token).await.map_err(|err| err.to_string())?;
+  let keys = state.api.get_keys(&token).await.unwrap_or_default();
   let groups = merge_groups(api_groups, &subscriptions, &keys);
 
   let mut guard = state.data.write().await;
@@ -479,11 +558,7 @@ async fn app_set_selected_key(state: State<'_, SharedState>, key_id: Option<u64>
 #[tauri::command]
 async fn app_logout(state: State<'_, SharedState>) -> Result<AppStateData, String> {
   let mut guard = state.data.write().await;
-  let selected_tool = guard.selected_tool.clone();
-  *guard = AppStateData {
-    selected_tool,
-    ..Default::default()
-  };
+  clear_auth_state(&mut guard);
   persist_state(&guard).map_err(|err| err.to_string())?;
   Ok(guard.clone())
 }

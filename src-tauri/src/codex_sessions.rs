@@ -17,6 +17,7 @@ const DEFAULT_MODEL_PROVIDER: &str = "ai8888";
 #[derive(Default)]
 struct ModelProviderLookup {
   aliases: HashMap<String, String>,
+  active_key: Option<String>,
   active_name: Option<String>,
 }
 
@@ -166,7 +167,11 @@ pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Op
 
 pub fn repair_visibility(requests: &[CodexSessionVisibilityRepairRequest]) -> Vec<CodexSessionVisibilityRepairOutcome> {
   let providers = load_model_provider_lookup();
-  let visible_provider = providers.active_name.as_deref().unwrap_or(DEFAULT_MODEL_PROVIDER);
+  // Codex filters/resumes by provider key (e.g. "ai8888"), not display name (e.g. "AI8888").
+  let visible_provider = providers
+    .active_key
+    .as_deref()
+    .unwrap_or(DEFAULT_MODEL_PROVIDER);
   requests
     .iter()
     .map(|request| match repair_session_visibility(&request.session_id, &request.source_path, visible_provider, &providers) {
@@ -225,18 +230,20 @@ fn repair_session_visibility(session_id: &str, source_path: &str, visible_provid
       continue;
     };
 
-    if let Some(id) = payload.get("id").and_then(Value::as_str) {
+    let recorded_id = payload
+      .get("id")
+      .and_then(Value::as_str)
+      .or_else(|| payload.get("session_id").and_then(Value::as_str));
+    if let Some(id) = recorded_id {
       if id != session_id {
         return Err(AppError::Message(format!("Codex session ID mismatch: expected {session_id}, found {id}")));
       }
     }
 
-    let provider_matches = payload
-      .get("model_provider")
-      .and_then(Value::as_str)
-      .map(|value| value == visible_provider)
-      .unwrap_or(false);
-    if provider_matches {
+    let current_provider = payload.get("model_provider").and_then(Value::as_str);
+    // Already stored as the active provider key: leave it alone.
+    // Display names / aliases that differ are rewritten to the active key.
+    if current_provider == Some(visible_provider) {
       next_lines.push(line.to_string());
       continue;
     }
@@ -276,6 +283,7 @@ fn load_model_provider_lookup() -> ModelProviderLookup {
   let Ok(config) = toml::from_str::<toml::Value>(&content) else { return ModelProviderLookup::default(); };
   let active_key = config.get("model_provider").and_then(toml::Value::as_str);
   let mut lookup = ModelProviderLookup::default();
+  lookup.active_key = active_key.map(str::to_string);
   if let Some(key) = active_key {
     lookup.aliases.insert(key.to_ascii_lowercase(), key.to_string());
   }
@@ -298,6 +306,9 @@ fn load_model_provider_lookup() -> ModelProviderLookup {
   }
   if lookup.active_name.is_none() {
     lookup.active_name = active_key.map(str::to_string);
+  }
+  if lookup.active_key.is_none() {
+    lookup.active_key = active_key.map(str::to_string);
   }
 
   lookup
@@ -352,7 +363,13 @@ fn parse_session(path: &Path, providers: &ModelProviderLookup) -> Option<CodexSe
         if is_subagent_source(payload.get("source")) {
           return None;
         }
-        session_id = session_id.or_else(|| payload.get("id").and_then(Value::as_str).map(str::to_string));
+        session_id = session_id.or_else(|| {
+          payload
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("session_id").and_then(Value::as_str))
+            .map(str::to_string)
+        });
         project_dir = project_dir.or_else(|| payload.get("cwd").and_then(Value::as_str).map(str::to_string));
         model_provider = model_provider.or_else(|| payload.get("model_provider").and_then(Value::as_str).map(str::to_string));
       }
@@ -666,7 +683,7 @@ mod tests {
   }
 
   #[test]
-  fn repairs_visibility_to_active_provider_display_name() {
+  fn repairs_visibility_to_active_provider_key_not_display_name() {
     with_codex_home(|root| {
       fs::write(root.join("config.toml"), "model_provider = \"ai8888\"\n[model_providers.ai8888]\nname = \"AI8888\"\n").expect("write config");
       let active = root.join("sessions");
@@ -681,8 +698,55 @@ mod tests {
 
       assert!(outcomes[0].success);
       assert!(outcomes[0].changed);
-      let content = fs::read_to_string(source).expect("read repaired session");
-      assert!(content.contains("\"model_provider\":\"AI8888\""));
+      let content = fs::read_to_string(&source).expect("read repaired session");
+      assert!(content.contains("\"model_provider\":\"ai8888\""));
+      assert!(!content.contains("\"model_provider\":\"AI8888\""));
+      assert!(!content.contains("\"model_provider\":\"custom\""));
     });
   }
+
+  #[test]
+  fn does_not_rewrite_session_already_on_active_provider_key() {
+    with_codex_home(|root| {
+      fs::write(root.join("config.toml"), "model_provider = \"ai8888\"\n[model_providers.ai8888]\nname = \"AI8888\"\n").expect("write config");
+      let active = root.join("sessions");
+      fs::create_dir_all(&active).expect("active dir");
+      let source = active.join("session.jsonl");
+      let original = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"already-ok\",\"session_id\":\"already-ok\",\"model_provider\":\"ai8888\"}}\n";
+      fs::write(&source, original).expect("write session");
+
+      let outcomes = repair_visibility(&[CodexSessionVisibilityRepairRequest {
+        session_id: "already-ok".into(),
+        source_path: source.to_string_lossy().to_string(),
+      }]);
+
+      assert!(outcomes[0].success);
+      assert!(!outcomes[0].changed);
+      let content = fs::read_to_string(source).expect("read session");
+      assert_eq!(content, original);
+    });
+  }
+
+  #[test]
+  fn normalizes_display_name_provider_to_active_key() {
+    with_codex_home(|root| {
+      fs::write(root.join("config.toml"), "model_provider = \"ai8888\"\n[model_providers.ai8888]\nname = \"AI8888\"\n").expect("write config");
+      let active = root.join("sessions");
+      fs::create_dir_all(&active).expect("active dir");
+      let source = active.join("session.jsonl");
+      fs::write(&source, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"display-name-id\",\"model_provider\":\"AI8888\"}}\n").expect("write session");
+
+      let outcomes = repair_visibility(&[CodexSessionVisibilityRepairRequest {
+        session_id: "display-name-id".into(),
+        source_path: source.to_string_lossy().to_string(),
+      }]);
+
+      assert!(outcomes[0].success);
+      assert!(outcomes[0].changed);
+      let content = fs::read_to_string(source).expect("read repaired session");
+      assert!(content.contains("\"model_provider\":\"ai8888\""));
+      assert!(!content.contains("\"model_provider\":\"AI8888\""));
+    });
+  }
+
 }
