@@ -1,10 +1,19 @@
-name: Build desktop packages
+﻿name: Build and release desktop packages
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional release tag (for example v0.0.3). Leave empty to only build artifacts.
+        required: false
+        type: string
+        default: ""
   push:
     tags:
       - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -15,20 +24,35 @@ jobs:
           - platform: windows-latest
             artifact: windows-x64
             build_args: ""
-            bundle_path: src-tauri/target/release/bundle/**/*
+            bundle_path: src-tauri/target/release/bundle
           - platform: ubuntu-22.04
             artifact: linux-x64
             build_args: ""
-            bundle_path: src-tauri/target/release/bundle/**/*
+            bundle_path: src-tauri/target/release/bundle
           - platform: macos-latest
             artifact: macos-universal
             build_args: --target universal-apple-darwin
-            bundle_path: src-tauri/target/universal-apple-darwin/release/bundle/**/*
+            bundle_path: src-tauri/target/universal-apple-darwin/release/bundle
 
     runs-on: ${{ matrix.platform }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve version label
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            label="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            label="${{ inputs.tag }}"
+          else
+            label="$(node -p "require('./package.json').version")"
+            label="v${label#v}"
+          fi
+          echo "label=${label}" >> "$GITHUB_OUTPUT"
+          echo "Using version label: ${label}"
 
       - uses: actions/setup-node@v4
         with:
@@ -52,8 +76,94 @@ jobs:
       - name: Build packages
         run: npm run tauri build -- ${{ matrix.build_args }}
 
+      - name: Stage installers
+        shell: bash
+        run: |
+          mkdir -p staged
+          if [ -d "${{ matrix.bundle_path }}" ]; then
+            find "${{ matrix.bundle_path }}" -type f \( \
+              -name '*.msi' -o \
+              -name '*-setup.exe' -o \
+              -name '*.exe' -o \
+              -name '*.deb' -o \
+              -name '*.rpm' -o \
+              -name '*.AppImage' -o \
+              -name '*.dmg' -o \
+              -name '*.pkg' \
+            \) -print -exec cp '{}' staged/ \;
+          fi
+          count="$(find staged -type f | wc -l | tr -d ' ')"
+          echo "Staged ${count} installer file(s) for ${{ matrix.artifact }}"
+          ls -lh staged || true
+          if [ "$count" -lt 1 ]; then
+            echo "No installer artifacts found for ${{ matrix.artifact }}" >&2
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ai8888-switch-v0.0.3-${{ matrix.artifact }}
-          path: ${{ matrix.bundle_path }}
+          name: ai8888-switch-${{ steps.version.outputs.label }}-${{ matrix.artifact }}
+          path: staged/*
           if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' || inputs.tag != ''
+    needs: build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Resolve release tag
+        id: release_meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          if [ -z "$tag" ]; then
+            echo "Release tag is empty" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Creating/updating GitHub Release for ${tag}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ai8888-switch-*
+          merge-multiple: false
+
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( \
+            -name '*.msi' -o \
+            -name '*-setup.exe' -o \
+            -name '*.exe' -o \
+            -name '*.deb' -o \
+            -name '*.rpm' -o \
+            -name '*.AppImage' -o \
+            -name '*.dmg' -o \
+            -name '*.pkg' \
+          \) -print -exec cp '{}' release-assets/ \;
+          count="$(find release-assets -type f | wc -l | tr -d ' ')"
+          echo "Collected ${count} installer file(s)"
+          ls -lh release-assets || true
+          if [ "$count" -lt 1 ]; then
+            echo "No installer artifacts found" >&2
+            exit 1
+          fi
+          if [ "$count" -lt 3 ]; then
+            echo "Warning: expected installers from multiple platforms, found only ${count}" >&2
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          name: AI8888 Switch ${{ steps.release_meta.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*
