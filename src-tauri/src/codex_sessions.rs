@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -288,9 +289,7 @@ fn truncate_snippet(text: &str, query: &str) -> String {
 }
 
 pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Option<&str>) -> Result<(), AppError> {
-  if session_id.trim().is_empty() || session_id.chars().any(|ch| ch.is_control()) {
-    return Err(AppError::Message("invalid Codex session id".into()));
-  }
+  let session_id = validate_session_id(session_id)?;
   let model_provider_key = validate_model_provider_key(model_provider_key)?;
 
   #[cfg(target_os = "windows")]
@@ -299,7 +298,7 @@ pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Op
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 
     let mut command = std::process::Command::new("cmd");
-    command.args(["/K", "codex", "resume"]);
+    command.args(["/D", "/K", "codex", "resume"]);
     if let Some(provider) = model_provider_key {
       command.args(["-c", &format!("model_provider={provider}")]);
     }
@@ -314,31 +313,38 @@ pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Op
 
   #[cfg(target_os = "macos")]
   {
+    use std::os::unix::fs::PermissionsExt;
+    let shell_quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
     let mut resume = String::from("codex resume");
     if let Some(provider) = model_provider_key {
-      resume.push_str(&format!(" -c model_provider={provider}"));
+      resume.push_str(" -c ");
+      resume.push_str(&shell_quote(&format!("model_provider={provider}")));
     }
     resume.push(' ');
-    resume.push_str(session_id);
+    resume.push_str(&shell_quote(session_id));
 
-    // Escape for embedding inside an AppleScript double-quoted string.
-    let escape_as = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
-    let mut shell = resume;
-    shell.push_str("; echo; echo \"[AI8888] resume finished. Press Enter to close.\"; read");
-    let shell = escape_as(&shell);
+    let script_path = std::env::temp_dir().join(format!("ai8888-codex-resume-{}-{session_id}.command", std::process::id()));
+    let mut script = String::from("#!/bin/zsh\nset +e\n");
+    if let Some(cwd) = cwd.and_then(existing_dir) {
+      script.push_str(&format!("cd -- {} || exit 1\n", shell_quote(&cwd.display().to_string())));
+    }
+    script.push_str(&resume);
+    script.push_str("\nstatus=$?\n");
+    script.push_str(&format!("rm -f -- {}\n", shell_quote(&script_path.display().to_string())));
+    script.push_str("echo\necho '[AI8888] resume finished. Press Enter to close.'\nread -r\nexit $status\n");
+    fs::write(&script_path, script.as_bytes()).map_err(|err| AppError::io(&script_path, err))?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).map_err(|err| AppError::io(&script_path, err))?;
 
-    let script = if let Some(cwd) = cwd.and_then(existing_dir) {
-      let cwd_str = escape_as(&cwd.display().to_string());
-      format!("tell application \"Terminal\" to do script \"cd \\\"{cwd_str}\\\"; {shell}\"")
+    let status = std::process::Command::new("open")
+      .args(["-a", "Terminal"])
+      .arg(&script_path)
+      .status()
+      .map_err(|err| AppError::Message(format!("failed to open Terminal on macOS: {err}")))?;
+    if status.success() {
+      Ok(())
     } else {
-      format!("tell application \"Terminal\" to do script \"{shell}\"")
-    };
-
-    match std::process::Command::new("osascript").args(["-e", &script]).spawn() {
-      Ok(_) => Ok(()),
-      Err(err) => Err(AppError::Message(format!(
-        "failed to launch Codex resume on macOS ({err}). Copy and run the resume command manually instead."
-      ))),
+      let _ = fs::remove_file(&script_path);
+      Err(AppError::Message(format!("Terminal refused the Codex resume script (exit code {status})")))
     }
   }
 
@@ -440,9 +446,7 @@ pub fn repair_visibility(requests: &[CodexSessionVisibilityRepairRequest]) -> Ve
 }
 
 fn repair_session_visibility(session_id: &str, source_path: &str, visible_provider: &str, providers: &ModelProviderLookup) -> Result<bool, AppError> {
-  if session_id.trim().is_empty() || session_id.chars().any(|ch| ch.is_control()) {
-    return Err(AppError::Message("invalid Codex session id".into()));
-  }
+  let session_id = validate_session_id(session_id)?;
 
   let path = validate_session_source(source_path)?;
   let meta = parse_session(&path, providers).ok_or_else(|| AppError::Message("failed to parse Codex session metadata".into()))?;
@@ -512,8 +516,75 @@ fn repair_session_visibility(session_id: &str, source_path: &str, visible_provid
     atomic_write(&path, next.as_bytes())?;
   }
 
+  let state_changed = repair_state_visibility(session_id, visible_provider)?;
+  Ok(changed || state_changed)
+}
+
+fn repair_state_visibility(session_id: &str, visible_provider: &str) -> Result<bool, AppError> {
+  let mut changed = false;
+  for database in state_database_paths() {
+    let connection = Connection::open(&database)
+      .map_err(|err| AppError::Message(format!("failed to open Codex state database {}: {err}", database.display())))?;
+    connection
+      .busy_timeout(std::time::Duration::from_secs(5))
+      .map_err(|err| AppError::Message(format!("failed to configure Codex state database {}: {err}", database.display())))?;
+
+    // Codex state schemas vary by version, so update only the columns present in each database.
+    let columns = {
+      let mut statement = connection
+        .prepare("PRAGMA table_info(threads)")
+        .map_err(|err| AppError::Message(format!("failed to inspect Codex state database {}: {err}", database.display())))?;
+      let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| AppError::Message(format!("failed to inspect Codex state database {}: {err}", database.display())))?;
+      let columns = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| AppError::Message(format!("failed to inspect Codex state database {}: {err}", database.display())))?;
+      columns
+    };
+    let has_column = |name: &str| columns.iter().any(|column| column == name);
+    if !has_column("id") || !has_column("model_provider") {
+      continue;
+    }
+
+    let mut assignments = vec!["model_provider = ?1"];
+    let mut conditions = vec!["model_provider IS NOT ?1"];
+    if has_column("archived") {
+      assignments.push("archived = 0");
+      conditions.push("archived IS NOT 0");
+    }
+    if has_column("archived_at") {
+      assignments.push("archived_at = NULL");
+      conditions.push("archived_at IS NOT NULL");
+    }
+    let sql = format!("UPDATE threads SET {} WHERE id = ?2 AND ({})", assignments.join(", "), conditions.join(" OR "));
+    let updated = connection
+      .execute(&sql, params![visible_provider, session_id])
+      .map_err(|err| AppError::Message(format!("failed to update Codex state database {}: {err}", database.display())))?;
+    changed |= updated > 0;
+  }
   Ok(changed)
 }
+
+fn state_database_paths() -> Vec<PathBuf> {
+  let root = codex_dir();
+  let Ok(entries) = fs::read_dir(root) else { return Vec::new(); };
+  let mut databases = entries
+    .flatten()
+    .map(|entry| entry.path())
+    .filter(|path| {
+      let Some(name) = path.file_name().and_then(|name| name.to_str()) else { return false; };
+      name
+        .strip_prefix("state_")
+        .and_then(|value| value.strip_suffix(".sqlite"))
+        .map(|version| !version.is_empty() && version.chars().all(|ch| ch.is_ascii_digit()))
+        .unwrap_or(false)
+    })
+    .collect::<Vec<_>>();
+  databases.sort();
+  databases
+}
+
 fn existing_dir(path: &str) -> Option<PathBuf> {
   let path = PathBuf::from(path);
   path.is_dir().then_some(path)
@@ -567,6 +638,16 @@ fn validate_model_provider_key(value: Option<&str>) -> Result<Option<&str>, AppE
   } else {
     Err(AppError::Message("invalid Codex model provider key".into()))
   }
+}
+
+fn validate_session_id(value: &str) -> Result<&str, AppError> {
+  if value.is_empty()
+    || value.len() > 128
+    || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+  {
+    return Err(AppError::Message("invalid Codex session id".into()));
+  }
+  Ok(value)
 }
 
 fn session_roots() -> Vec<PathBuf> {
@@ -949,6 +1030,59 @@ mod tests {
       assert!(!content.contains("\"model_provider\":\"AI8888\""));
       assert!(!content.contains("\"model_provider\":\"custom\""));
     });
+  }
+
+  #[test]
+  fn repairs_visibility_in_codex_state_databases() {
+    with_codex_home(|root| {
+      fs::write(root.join("config.toml"), "model_provider = \"ai8888\"\n").expect("write config");
+      let active = root.join("sessions");
+      fs::create_dir_all(&active).expect("active dir");
+      let source = active.join("session.jsonl");
+      let original = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"state-repair-id\",\"model_provider\":\"ai8888\"}}\n";
+      fs::write(&source, original).expect("write session");
+
+      let database = root.join("state_5.sqlite");
+      let connection = Connection::open(&database).expect("open state database");
+      connection.execute_batch(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL, archived INTEGER NOT NULL, archived_at INTEGER);\n\
+         INSERT INTO threads (id, model_provider, archived, archived_at) VALUES ('state-repair-id', 'AI8888', 1, 123);",
+      ).expect("seed state database");
+      let legacy_database = root.join("state_4.sqlite");
+      let legacy_connection = Connection::open(&legacy_database).expect("open legacy state database");
+      legacy_connection.execute_batch(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL);\n\
+         INSERT INTO threads (id, model_provider) VALUES ('state-repair-id', 'openai');",
+      ).expect("seed legacy state database");
+
+      let outcomes = repair_visibility(&[CodexSessionVisibilityRepairRequest {
+        session_id: "state-repair-id".into(),
+        source_path: source.to_string_lossy().to_string(),
+      }]);
+      assert!(outcomes[0].success);
+      assert!(outcomes[0].changed);
+      assert_eq!(fs::read_to_string(source).expect("read session"), original);
+      let row = connection
+        .query_row(
+          "SELECT model_provider, archived, archived_at FROM threads WHERE id = 'state-repair-id'",
+          [],
+          |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?)),
+        )
+        .expect("read repaired state");
+      assert_eq!(row, ("ai8888".to_string(), 0, None));
+      let legacy_provider = legacy_connection
+        .query_row("SELECT model_provider FROM threads WHERE id = 'state-repair-id'", [], |row| row.get::<_, String>(0))
+        .expect("read repaired legacy state");
+      assert_eq!(legacy_provider, "ai8888");
+    });
+  }
+
+  #[test]
+  fn rejects_session_ids_that_could_be_interpreted_by_a_shell() {
+    for value in ["id&calc", "id;open", "$(open)", "`open`", "id with space", "../id"] {
+      assert!(validate_session_id(value).is_err(), "accepted unsafe session id: {value}");
+    }
+    assert!(validate_session_id("019f5add-747e-7121-9c0b-6413e1064906").is_ok());
   }
 
   #[test]

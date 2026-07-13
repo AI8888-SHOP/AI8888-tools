@@ -1,22 +1,41 @@
-﻿name: Build and release desktop packages
+name: Build and release desktop packages
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Optional release tag (for example v0.0.3). Leave empty to only build artifacts.
-        required: false
-        type: string
-        default: ""
   push:
+    branches:
+      - master
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  verify:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: npm ci
+
+      - name: Verify source
+        run: npm run verify
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -43,13 +62,11 @@ jobs:
         id: version
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             label="${GITHUB_REF_NAME}"
-          elif [ -n "${{ inputs.tag }}" ]; then
-            label="${{ inputs.tag }}"
           else
             label="$(node -p "require('./package.json').version")"
-            label="v${label#v}"
+            label="v${label#v}-${GITHUB_SHA::7}"
           fi
           echo "label=${label}" >> "$GITHUB_OUTPUT"
           echo "Using version label: ${label}"
@@ -73,7 +90,37 @@ jobs:
 
       - run: npm ci
 
+      - name: Detect Apple signing configuration
+        if: matrix.platform == 'macos-latest'
+        id: apple_signing
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ] && [ -n "$APPLE_SIGNING_IDENTITY" ] && [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build signed and notarized macOS packages
+        if: matrix.platform == 'macos-latest' && steps.apple_signing.outputs.enabled == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri build -- ${{ matrix.build_args }}
+
       - name: Build packages
+        if: matrix.platform != 'macos-latest' || steps.apple_signing.outputs.enabled != 'true'
         run: npm run tauri build -- ${{ matrix.build_args }}
 
       - name: Stage installers
@@ -107,20 +154,18 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push' || inputs.tag != ''
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
 
     steps:
       - name: Resolve release tag
         id: release_meta
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            tag="${GITHUB_REF_NAME}"
-          else
-            tag="${{ inputs.tag }}"
-          fi
+          tag="${GITHUB_REF_NAME}"
           if [ -z "$tag" ]; then
             echo "Release tag is empty" >&2
             exit 1
@@ -151,19 +196,61 @@ jobs:
           count="$(find release-assets -type f | wc -l | tr -d ' ')"
           echo "Collected ${count} installer file(s)"
           ls -lh release-assets || true
-          if [ "$count" -lt 1 ]; then
-            echo "No installer artifacts found" >&2
+          windows_msi="$(find release-assets -maxdepth 1 -type f -name '*.msi' | wc -l | tr -d ' ')"
+          windows_nsis="$(find release-assets -maxdepth 1 -type f -name '*-setup.exe' | wc -l | tr -d ' ')"
+          macos_dmg="$(find release-assets -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          linux_appimage="$(find release-assets -maxdepth 1 -type f -name '*.AppImage' | wc -l | tr -d ' ')"
+          linux_deb="$(find release-assets -maxdepth 1 -type f -name '*.deb' | wc -l | tr -d ' ')"
+          linux_rpm="$(find release-assets -maxdepth 1 -type f -name '*.rpm' | wc -l | tr -d ' ')"
+          if [ "$windows_msi" -lt 1 ] || [ "$windows_nsis" -lt 1 ] || [ "$macos_dmg" -lt 1 ] || [ "$linux_appimage" -lt 1 ] || [ "$linux_deb" -lt 1 ] || [ "$linux_rpm" -lt 1 ]; then
+            echo "Missing required release assets: msi=${windows_msi}, nsis=${windows_nsis}, dmg=${macos_dmg}, appimage=${linux_appimage}, deb=${linux_deb}, rpm=${linux_rpm}" >&2
             exit 1
           fi
-          if [ "$count" -lt 3 ]; then
-            echo "Warning: expected installers from multiple platforms, found only ${count}" >&2
+
+      - name: Refuse to overwrite a published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
+        shell: bash
+        run: |
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>/dev/null)"; then
+            if [ "$(jq -r '.draft' <<<"$release_json")" != "true" ]; then
+              echo "Release ${RELEASE_TAG} is already published; refusing to overwrite it" >&2
+              exit 1
+            fi
           fi
 
-      - name: Create GitHub Release
+      - name: Create draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           name: AI8888 Switch ${{ steps.release_meta.outputs.tag }}
           generate_release_notes: true
+          draft: true
+          make_latest: false
           fail_on_unmatched_files: true
           files: release-assets/*
+
+      - name: Verify uploaded assets and publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
+        shell: bash
+        run: |
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if [ "$(jq -r '.draft' <<<"$release_json")" != "true" ]; then
+            echo "Release must remain draft until asset verification succeeds" >&2
+            exit 1
+          fi
+          assets="$(jq '.assets' <<<"$release_json")"
+          for pattern in '\.msi$' '-setup\.exe$' '\.dmg$' '\.AppImage$' '\.deb$' '\.rpm$'; do
+            if ! jq -e --arg pattern "$pattern" 'any(.[]; .name | test($pattern; "i"))' <<<"$assets" >/dev/null; then
+              echo "Uploaded release is missing required asset pattern: $pattern" >&2
+              exit 1
+            fi
+          done
+          if ! jq -e 'all(.[]; (.digest // "") | test("^sha256:[0-9a-fA-F]{64}$"))' <<<"$assets" >/dev/null; then
+            echo "One or more uploaded assets are missing a GitHub SHA-256 digest" >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest

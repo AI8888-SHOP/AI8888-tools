@@ -2,7 +2,7 @@ use serde_json::json;
 use toml::value::Table as TomlTable;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{local_route_manifest_path, normalize_api_base_url, normalize_base_url, path_for, read_json, write_json, write_text, LOCAL_PROXY_BASE_URL, LOCAL_PROXY_OPENAI_BASE_URL, LOCAL_PROXY_PROFILE_NAME, OPENAI_BASE_URL};
@@ -55,7 +55,7 @@ pub fn supported_tools() -> Vec<ToolProfile> {
     description: description.into(),
     directory: path_for(tool.as_str(), "").display().to_string(),
     config_path: primary_config_path(tool),
-    notes: Some("写入前会保留 .ai8888-switch.bak 备份".into()),
+    notes: Some("写入前会创建可回滚的版本化快照".into()),
   })
   .collect()
 }
@@ -351,11 +351,38 @@ pub fn build_tool_preview(target: &SwitchTarget) -> Vec<(String, String)> {
   dedupe_preview_items(items)
 }
 
+pub fn managed_paths_for_target(target: &SwitchTarget) -> Vec<(PathBuf, String)> {
+  build_tool_preview(target).into_iter().map(|(path, label)| (PathBuf::from(path), label)).collect()
+}
+
+pub fn all_managed_config_paths() -> Vec<PathBuf> {
+  [
+    path_for("codex", "config.toml"),
+    path_for("claude", "settings.json"),
+    path_for("opencode", "opencode.json"),
+    path_for("openclaw", "openclaw.json"),
+    path_for("hermes", "config.yaml"),
+    path_for("gemini", ".env"),
+    path_for("gemini", "settings.json"),
+    local_route_manifest_path(),
+  ].into_iter().collect()
+}
+
+pub fn managed_paths_for_route_cleanup() -> Vec<(PathBuf, String)> {
+  [
+    (path_for("codex", "config.toml"), "Codex config.toml".into()),
+    (path_for("claude", "settings.json"), "Claude settings.json".into()),
+    (path_for("opencode", "opencode.json"), "OpenCode opencode.json".into()),
+    (path_for("gemini", ".env"), "Gemini .env".into()),
+    (path_for("gemini", "settings.json"), "Gemini settings.json".into()),
+    (local_route_manifest_path(), "本地路由清单".into()),
+  ].into_iter().collect()
+}
+
 fn preview_entries_for_tool(tool: ToolKind, _local_routing_enabled: bool) -> Vec<(String, String)> {
   match tool {
     ToolKind::Codex => vec![
       (path_for("codex", "config.toml").display().to_string(), "Codex config.toml".into()),
-      (path_for("codex", "auth.json").display().to_string(), "Codex auth.json".into()),
     ],
     ToolKind::Claude => vec![(path_for("claude", "settings.json").display().to_string(), "Claude settings.json".into())],
     ToolKind::OpenCode => vec![(path_for("opencode", "opencode.json").display().to_string(), "OpenCode opencode.json".into())],
@@ -368,7 +395,6 @@ fn preview_entries_for_app(app: &str) -> Vec<(String, String)> {
   match app {
     "codex" => vec![
       (path_for("codex", "config.toml").display().to_string(), "Codex config.toml".into()),
-      (path_for("codex", "auth.json").display().to_string(), "Codex auth.json".into()),
     ],
     "claude" => vec![(path_for("claude", "settings.json").display().to_string(), "Claude settings.json".into())],
     "opencode" => vec![(path_for("opencode", "opencode.json").display().to_string(), "OpenCode opencode.json".into())],
@@ -800,7 +826,6 @@ fn restore_file_from_backup(path: &std::path::Path) -> Result<bool, AppError> {
 pub fn restore_local_route_backups() -> Result<Vec<(String, String)>, AppError> {
   let targets = [
     (path_for("codex", "config.toml"), "Codex config.toml"),
-    (path_for("codex", "auth.json"), "Codex auth.json"),
     (path_for("claude", "settings.json"), "Claude settings.json"),
     (path_for("opencode", "opencode.json"), "OpenCode opencode.json"),
     (path_for("gemini", ".env"), "Gemini .env"),
@@ -957,15 +982,9 @@ fn cleanup_gemini_takeover(changed: &mut Vec<(String, String)>) -> Result<(), Ap
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::sync::{Mutex, OnceLock};
-
-  fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().expect("test lock")
-  }
 
   fn with_test_home<T>(name: &str, test: impl FnOnce() -> T) -> T {
-    let _guard = test_guard();
+    let _guard = crate::config::test_home_guard();
     let root = std::env::temp_dir().join(format!("ai8888-switch-{name}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(&root).expect("create test home");
     let old = std::env::var_os("AI8888_SWITCH_TEST_HOME");

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 import { buildAccountAlerts, isActiveSubscription, money, moneyOrDash, percentLabel, quotaLine, subscriptionProgressInfo, usageWindow, type GroupSummary, type SubscriptionProgress, type SubscriptionProgressInfo, type SubscriptionSummary } from "./subscription";
 
@@ -18,6 +19,12 @@ type EndpointProbeResult = { domain: string; baseUrl: string; attempts: number; 
 type EndpointProbeSummary = { selectedBaseUrl: string; selectedDomain: string; results: EndpointProbeResult[] };
 type UpdateCheckResult = { currentVersion: string; latestVersion?: string | null; updateAvailable: boolean; releaseUrl?: string | null; downloadUrl?: string | null; downloadAccelerated?: boolean; mainlandChina?: boolean; repository: string; error?: string | null };
 type UpdateInstallResult = { success: boolean; installerPath?: string | null; launched: boolean; message: string };
+type UpdateDownloadProgress = { taskId: string; status: string; downloadedBytes: number; totalBytes: number; percent: number; message: string };
+type ConfigSnapshotFile = { path: string; label: string; existed: boolean };
+type ConfigSnapshotSummary = { id: string; createdAt: number; label: string; files: ConfigSnapshotFile[] };
+type ConfigTransactionResult = { snapshot: ConfigSnapshotSummary; artifacts: [string, string][]; message: string };
+type ConfigProfile = { id: string; createdAt: number; updatedAt: number; name: string; tool: string; baseUrl: string; keyId?: number | null; keyHint?: string | null; hasStoredKey: boolean; model?: string | null; localRoutingEnabled: boolean; localRouteApps: string[]; localRouteModelMap: Record<string, string>; localRoutePreserveClaudeAuth: boolean; localRouteOnly: boolean };
+type ConfigProfileInput = { name: string; tool: string; baseUrl: string; keyId?: number | null; apiKey?: string | null; model?: string | null; localRoutingEnabled: boolean; localRouteApps: string[]; localRouteModelMap: Record<string, string>; localRoutePreserveClaudeAuth: boolean; localRouteOnly: boolean };
 type AppPreferences = { onboardingCompleted: boolean; onboardingStep: number; dismissedAlertIds: string[] };
 type CodexSessionMeta = { sessionId: string; title?: string | null; summary?: string | null; projectDir?: string | null; createdAt?: string | null; lastActiveAt?: string | null; modelProvider?: string | null; modelProviderKey?: string | null; sourcePath: string; resumeCommand: string; archived: boolean; modifiedAt: number };
 type CodexSessionSearchHit = { session: CodexSessionMeta; matchedIn: string[]; snippet?: string | null };
@@ -27,6 +34,17 @@ type CodexSessionVisibilityRepairOutcome = { sessionId: string; sourcePath: stri
 const defaultState: AppStateData = { account: null, subscriptions: [], subscriptionProgress: [], groups: [], keys: { items: [], total: 0 }, selectedTool: "codex", selectedKeyId: null, loginWindowOpen: false };
 
 function safeDate(value?: string | null) { if (!value) return "-"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString(); }
+function safeTimestamp(value: number) { const date = new Date(value); return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString(); }
+function bytesLabel(value: number) { if (!Number.isFinite(value) || value <= 0) return "0 B"; const units = ["B", "KB", "MB", "GB"]; const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024))); return `${(value / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`; }
+function profileFingerprint(profile: ConfigProfile | ConfigProfileInput) {
+  const modelMap = Object.fromEntries(Object.entries(profile.localRouteModelMap || {}).filter(([, value]) => Boolean(value?.trim())).sort(([left], [right]) => left.localeCompare(right)));
+  return JSON.stringify({
+    name: profile.name.trim(), tool: profile.tool, baseUrl: profile.baseUrl.replace(/\/$/, ""), keyId: profile.keyId ?? null,
+    model: profile.model?.trim() || null, localRoutingEnabled: profile.localRoutingEnabled,
+    localRouteApps: [...(profile.localRouteApps || [])].sort(), localRouteModelMap: modelMap,
+    localRoutePreserveClaudeAuth: profile.localRoutePreserveClaudeAuth, localRouteOnly: profile.localRouteOnly,
+  });
+}
 function maskKey(value?: string | null) { if (!value) return "\u672a\u8fd4\u56de\u660e\u6587"; if (value.length <= 12) return value; return `${value.slice(0, 8)}...${value.slice(-4)}`; }
 function keyGroupId(key?: ApiKeySummary | null) { return key?.group?.id ?? key?.groupId ?? null; }
 function keyGroup(key: ApiKeySummary | null | undefined, groups: GroupSummary[]) { return key?.group ?? groups.find((group) => group.id === key?.groupId) ?? null; }
@@ -85,7 +103,7 @@ function AuthGate(props: { email: string; password: string; setEmail: (v: string
           <button onClick={props.onLogin} disabled={props.busy || !props.email || !props.password}>登录</button>
         </div>
       </section>
-      <footer className="appFooter">v0.0.4 Copyright AI8888.SHOP 2026</footer>
+      <footer className="appFooter">v0.0.5 Copyright AI8888.SHOP 2026</footer>
     </main>
   );
 }
@@ -370,6 +388,13 @@ function CodexSessionsApp() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress | null>(null);
+  const [configSnapshots, setConfigSnapshots] = useState<ConfigSnapshotSummary[]>([]);
+  const [restoringSnapshotId, setRestoringSnapshotId] = useState<string | null>(null);
+  const [profiles, setProfiles] = useState<ConfigProfile[]>([]);
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  const [profileNameDraft, setProfileNameDraft] = useState("");
+  const [profileBusyId, setProfileBusyId] = useState<string | null>(null);
   const [preferences, setPreferences] = useState<AppPreferences>({ onboardingCompleted: true, onboardingStep: 0, dismissedAlertIds: [] });
   const [showWizard, setShowWizard] = useState(false);
   const [routeCodexEnabled, setRouteCodexEnabled] = useState(false);
@@ -382,7 +407,8 @@ function CodexSessionsApp() {
   const [localRouteStatuses, setLocalRouteStatuses] = useState<LocalRouteStatus[]>([]);
 
   const selectedTool = useMemo(() => tools.find((tool) => tool.tool === state.selectedTool) ?? tools[0], [state.selectedTool, tools]);
-  const selectedKey = useMemo(() => state.keys.items.find((key) => key.id === state.selectedKeyId) ?? state.keys.items[0], [state.keys.items, state.selectedKeyId]);
+  const selectedKey = useMemo(() => state.selectedKeyId == null ? null : (state.keys.items.find((key) => key.id === state.selectedKeyId) ?? null), [state.keys.items, state.selectedKeyId]);
+  const selectedProfile = useMemo(() => profiles.find((profile) => profile.id === selectedProfileId) ?? null, [profiles, selectedProfileId]);
   const accountAlerts = useMemo(() => {
     const all = buildAccountAlerts({ balance: state.account?.balance, subscriptions: state.subscriptions, subscriptionProgress: state.subscriptionProgress });
     const dismissed = new Set(preferences.dismissedAlertIds || []);
@@ -401,6 +427,30 @@ function CodexSessionsApp() {
     if (routeOpenCodeEnabled) apps.push("opencode");
     return apps;
   }, [routeCodexEnabled, routeClaudeEnabled, routeOpenCodeEnabled]);
+  const currentProfileKeyId = useMemo(() => {
+    if (!selectedKey) return null;
+    const entered = manualKey.trim();
+    const selectedValue = selectedKey.key?.trim() || "";
+    return entered && entered !== selectedValue ? null : selectedKey.id;
+  }, [manualKey, selectedKey]);
+  const currentProfileInput = useMemo<ConfigProfileInput>(() => ({
+    name: profileNameDraft.trim(),
+    tool: state.selectedTool,
+    baseUrl,
+    keyId: currentProfileKeyId,
+    apiKey: currentProfileKeyId == null ? (manualKey.trim() || null) : null,
+    model: modelChoice || null,
+    localRoutingEnabled,
+    localRouteApps,
+    localRouteModelMap,
+    localRoutePreserveClaudeAuth,
+    localRouteOnly,
+  }), [profileNameDraft, state.selectedTool, baseUrl, currentProfileKeyId, manualKey, modelChoice, localRoutingEnabled, localRouteApps, localRouteModelMap, localRoutePreserveClaudeAuth, localRouteOnly]);
+  const profileDirty = Boolean(selectedProfile && (
+    profileFingerprint(currentProfileInput) !== profileFingerprint(selectedProfile)
+    || (selectedProfile.keyId == null && Boolean(manualKey.trim()))
+  ));
+  const profileFormHasUnsavedChanges = profileDirty || Boolean(!selectedProfile && (manualKey.trim() || modelChoice || localRoutingEnabled));
 
   async function run<T>(action: () => Promise<T>, okMessage: string) {
     setBusy(true); setError(null);
@@ -501,6 +551,23 @@ function CodexSessionsApp() {
     return () => window.clearInterval(timer);
   }, [checkUpdate]);
   useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<UpdateDownloadProgress>("update-download-progress", (event) => {
+      setUpdateProgress(event.payload);
+      if (["completed", "canceled", "failed"].includes(event.payload.status)) {
+        setInstallingUpdate(false);
+      }
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+  useEffect(() => {
     if (!isAuthenticated) return;
     const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
     // Keep usage/expiry alerts fresh while logged in.
@@ -526,19 +593,33 @@ function CodexSessionsApp() {
 
 
   async function installUpdate() {
-    if (!updateInfo?.downloadUrl) {
-      setMessage("\u6ca1\u6709\u53ef\u5b89\u88c5\u7684\u4e0b\u8f7d\u5730\u5740");
+    if (!updateInfo?.downloadUrl || !updateInfo.latestVersion) {
+      setMessage("\u6ca1\u6709\u53ef\u5b89\u88c5\u7684\u66f4\u65b0\u8d44\u6e90");
       return;
     }
-    setInstallingUpdate(true); setError(null);
+    setInstallingUpdate(true); setError(null); setUpdateProgress({ taskId: "", status: "preparing", downloadedBytes: 0, totalBytes: 0, percent: 0, message: "正在准备更新" });
     try {
-      const result = await invoke<UpdateInstallResult>("app_install_update", { downloadUrl: updateInfo.downloadUrl });
+      const result = await invoke<UpdateInstallResult>("app_install_update", {
+        version: updateInfo.latestVersion,
+        preferAccelerated: Boolean(updateInfo.downloadAccelerated),
+      });
       if (result.success) setMessage(result.message);
       else setError(result.message || "\u5b89\u88c5\u5931\u8d25");
     } catch (err) {
-      setError(String(err));
+      const text = String(err);
+      if (text.toLowerCase().includes("canceled")) setMessage("更新下载已取消");
+      else setError(text);
     } finally {
       setInstallingUpdate(false);
+    }
+  }
+
+  async function cancelUpdate() {
+    try {
+      const canceled = await invoke<boolean>("app_cancel_update");
+      setMessage(canceled ? "正在取消更新下载" : "当前没有进行中的更新下载");
+    } catch (err) {
+      setError(String(err));
     }
   }
 
@@ -603,26 +684,161 @@ function CodexSessionsApp() {
     return invoke<SwitchTarget>("app_prepare_switch", { tool: state.selectedTool, baseUrl, apiKey: effectiveKey, model: modelChoice || null, localRoutingEnabled, localRouteApps, localRouteModelMap, localRoutePreserveClaudeAuth, localRouteOnly });
   }
 
+  async function refreshProfiles(preferredId?: string | null) {
+    const next = await invoke<ConfigProfile[]>("app_list_config_profiles");
+    setProfiles(next);
+    const nextId = preferredId === undefined ? selectedProfileId : preferredId;
+    if (nextId && !next.some((profile) => profile.id === nextId)) {
+      setSelectedProfileId(null);
+    }
+    return next;
+  }
+
+  async function loadProfileIntoForm(profile: ConfigProfile, confirmDiscard = true) {
+    if (confirmDiscard && profileFormHasUnsavedChanges && !window.confirm("当前表单有未保存修改，确认载入其他 Profile？")) return;
+    setProfileBusyId(profile.id);
+    try {
+      await chooseTool(profile.tool);
+      setBaseUrl(profile.baseUrl);
+      const referencedKey = profile.keyId == null ? null : state.keys.items.find((key) => key.id === profile.keyId);
+      if (referencedKey) {
+        await chooseKey(referencedKey.id);
+      } else {
+        const next = await invoke<AppStateData>("app_set_selected_key", { keyId: null });
+        setState({ ...defaultState, ...next });
+        setManualKey("");
+      }
+      setSelectedModel(profile.model || "");
+      setRouteCodexEnabled(profile.localRoutingEnabled && profile.localRouteApps.includes("codex"));
+      setRouteClaudeEnabled(profile.localRoutingEnabled && profile.localRouteApps.includes("claude"));
+      setRouteOpenCodeEnabled(profile.localRoutingEnabled && profile.localRouteApps.includes("opencode"));
+      setLocalRouteModelMap({ sonnet: profile.localRouteModelMap.sonnet || "", opus: profile.localRouteModelMap.opus || "", haiku: profile.localRouteModelMap.haiku || "" });
+      setLocalRoutePreserveClaudeAuth(profile.localRoutePreserveClaudeAuth);
+      setLocalRouteOnly(profile.localRouteOnly);
+      setProfileNameDraft(profile.name);
+      setSelectedProfileId(profile.id);
+      if (profile.keyId != null && !referencedKey) setMessage("Profile 引用的远端 Key 当前不可用，请重新选择 Key");
+      else if (profile.hasStoredKey) setMessage("已载入 Profile；手动 Key 已隐藏，一键应用可直接使用");
+      else setMessage("已载入 Profile 到表单，尚未写入配置");
+    } finally {
+      setProfileBusyId(null);
+    }
+  }
+
+  async function saveConfigProfile(profileId?: string) {
+    const existing = profileId ? profiles.find((profile) => profile.id === profileId) : null;
+    if (!currentProfileInput.name) {
+      setError("请输入 Profile 名称");
+      return;
+    }
+    if (existing && !window.confirm(`确认用当前表单覆盖 Profile「${existing.name}」？`)) return;
+    setProfileBusyId(profileId || "new");
+    setError(null);
+    try {
+      const saved = await invoke<ConfigProfile>("app_save_config_profile", {
+        profileId: profileId || null,
+        expectedUpdatedAt: existing?.updatedAt ?? null,
+        profile: currentProfileInput,
+      });
+      await refreshProfiles(saved.id);
+      setSelectedProfileId(saved.id);
+      setProfileNameDraft(saved.name);
+      if (saved.keyId == null && saved.hasStoredKey) {
+        const next = await invoke<AppStateData>("app_set_selected_key", { keyId: null });
+        setState({ ...defaultState, ...next });
+        setManualKey("");
+      }
+      setMessage(existing ? "Profile 已覆盖保存" : "Profile 已创建");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setProfileBusyId(null);
+    }
+  }
+
+  async function deleteConfigProfile(profile: ConfigProfile) {
+    if (!window.confirm(`确认删除 Profile「${profile.name}」？此操作不会修改已写入的工具配置。`)) return;
+    setProfileBusyId(profile.id);
+    setError(null);
+    try {
+      await invoke("app_delete_config_profile", { profileId: profile.id, expectedUpdatedAt: profile.updatedAt });
+      await refreshProfiles(profile.id === selectedProfileId ? null : selectedProfileId);
+      if (profile.id === selectedProfileId) {
+        setSelectedProfileId(null);
+        setProfileNameDraft("");
+      }
+      setMessage("Profile 已删除");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setProfileBusyId(null);
+    }
+  }
+
+  async function applyConfigProfile(profile: ConfigProfile) {
+    if (profileFormHasUnsavedChanges && !window.confirm("当前表单有未保存修改，确认直接应用所选 Profile？")) return;
+    setProfileBusyId(profile.id);
+    try {
+      const result = await run(() => invoke<ConfigTransactionResult>("app_apply_config_profile", { profileId: profile.id, apiKeyOverride: null }), "正在应用 Profile");
+      if (result) {
+        setPreview(result.artifacts);
+        await loadProfileIntoForm(profile, false);
+        setMessage(result.message);
+      }
+      await refreshConfigSnapshots();
+      await refreshLocalRouteManifest();
+    } finally {
+      setProfileBusyId(null);
+    }
+  }
+
+  async function refreshConfigSnapshots() {
+    try {
+      setConfigSnapshots(await invoke<ConfigSnapshotSummary[]>("app_list_config_snapshots"));
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function restoreConfigSnapshot(snapshotId: string) {
+    setRestoringSnapshotId(snapshotId);
+    try {
+      const result = await run(() => invoke<ConfigTransactionResult>("app_restore_config_snapshot", { snapshotId }), "已恢复配置版本");
+      if (result) {
+        setPreview(result.artifacts);
+        setMessage(result.message);
+      }
+      await refreshConfigSnapshots();
+      await refreshLocalRouteManifest();
+    } finally {
+      setRestoringSnapshotId(null);
+    }
+  }
+
   async function showPreview() { const target = await run(prepareTarget, "已生成写入预览"); if (!target) return; setPreview(await invoke<[string, string][]>("app_copy_target_preview", { target })); }
-  async function writeSwitch() { const target = await run(prepareTarget, "已生成写入目标"); if (!target) return; const artifacts = await run(() => invoke<[string, string][]>("app_write_switch", { target }), localRoutingEnabled ? "已写入配置并启动本地路由" : "已写入配置"); if (artifacts) setPreview(artifacts); await refreshLocalRouteManifest(); }
+  async function writeSwitch() { const target = await run(prepareTarget, "已生成写入目标"); if (!target) return; const result = await run(() => invoke<ConfigTransactionResult>("app_write_switch", { target }), localRoutingEnabled ? "已写入配置并启动本地路由" : "已写入配置"); if (result) { setPreview(result.artifacts); setMessage(result.message); } await refreshConfigSnapshots(); await refreshLocalRouteManifest(); }
   async function copyKey() { if (!effectiveKey) return; await navigator.clipboard.writeText(effectiveKey); setMessage("API Key 已复制"); }
-  async function cleanupLocalRoute() { const artifacts = await run(() => invoke<[string, string][]>("app_cleanup_local_route_takeover"), "已清理本地接管"); if (artifacts) setPreview(artifacts); await refreshLocalRouteManifest(); }
-  async function restoreLocalRouteBackups() { const artifacts = await run(() => invoke<[string, string][]>("app_restore_local_route_backups"), "已从备份恢复配置"); if (artifacts) setPreview(artifacts); await refreshLocalRouteManifest(); }
+  async function cleanupLocalRoute() { const result = await run(() => invoke<ConfigTransactionResult>("app_cleanup_local_route_takeover"), "已清理本地接管"); if (result) { setPreview(result.artifacts); setMessage(result.message); } await refreshConfigSnapshots(); await refreshLocalRouteManifest(); }
+  async function restoreLocalRouteBackups() { const result = await run(() => invoke<ConfigTransactionResult>("app_restore_local_route_backups"), "已从备份恢复配置"); if (result) { setPreview(result.artifacts); setMessage(result.message); } await refreshConfigSnapshots(); await refreshLocalRouteManifest(); }
   function updateLocalRouteModel(role: string, value: string) { setLocalRouteModelMap((current) => ({ ...current, [role]: value })); }
   function fillLocalRouteModels() { if (!modelChoice) return; setLocalRouteModelMap({ sonnet: modelChoice, opus: modelChoice, haiku: modelChoice }); }
 
   useEffect(() => { void (async () => {
     try {
-      const [nextState, nextTools, nextEndpoint, nextManifest, nextStatuses, nextPrefs] = await Promise.all([
+      const [nextState, nextTools, nextEndpoint, nextManifest, nextStatuses, nextPrefs, nextSnapshots, nextProfiles] = await Promise.all([
         invoke<AppStateData>("app_get_state"),
         invoke<ToolProfile[]>("app_get_tools"),
         invoke<EndpointProbeSummary>("app_get_endpoint").catch(() => null),
         invoke<LocalRouteManifest>("app_get_local_route_manifest").catch(() => null),
         invoke<LocalRouteStatus[]>("app_get_local_route_statuses").catch(() => []),
         invoke<AppPreferences>("app_get_preferences").catch(() => ({ onboardingCompleted: false, onboardingStep: 0, dismissedAlertIds: [] })),
+        invoke<ConfigSnapshotSummary[]>("app_list_config_snapshots").catch(() => []),
+        invoke<ConfigProfile[]>("app_list_config_profiles").catch(() => []),
       ]);
       setPreferences(nextPrefs || { onboardingCompleted: false, onboardingStep: 0, dismissedAlertIds: [] });
       setShowWizard(!(nextPrefs?.onboardingCompleted));
+      setConfigSnapshots(nextSnapshots);
+      setProfiles(nextProfiles);
       setTools(nextTools);
       if (nextEndpoint) {
         setEndpointProbe(nextEndpoint);
@@ -665,7 +881,7 @@ function CodexSessionsApp() {
         <div className="statusCard"><span className="dot ok" /><div><strong>已登录</strong><small>{message}</small><small className="balanceLine">账户余额：{money(state.account?.balance ?? 0)} <button className="ghost mini inlineRefresh" onClick={() => { void refreshRemote(); }} disabled={busy}>刷新</button></small><div className="statusActions"><button className="ghost mini statusButton" onClick={openPurchase}>充值续费</button><button className="ghost mini statusButton" onClick={openRadar}>智商雷达</button><button className="ghost mini statusButton" onClick={openModelStatus}>模型监控</button><button className="ghost mini statusButton" onClick={logout} disabled={busy}>退出登录</button></div></div></div>
       </section>
       {error && <div className="alert">{error}</div>}{modelError && <div className="alert">{modelError}</div>}
-      
+
       {accountAlerts.length > 0 && <section className="alertStack">{accountAlerts.slice(0, 4).map((alert) => <article className={"alertCard " + alert.level} key={alert.id}><div><strong>{alert.title}</strong><p>{alert.detail}</p></div><div className="alertActions">{alert.action === "purchase" && <button className="secondary mini" onClick={() => void openPurchase()}>{"\u5145\u503c\u7eed\u8d39"}</button>}{alert.action === "refresh" && <button className="ghost mini" onClick={() => { void refreshRemote(); }} disabled={busy}>{"\u5237\u65b0\u7528\u91cf"}</button>}<button className="ghost mini" onClick={() => void dismissAlert(alert.id)}>{"\u5ffd\u7565"}</button></div></article>)}</section>}
 
       {showWizard && isAuthenticated && (
@@ -726,6 +942,25 @@ function CodexSessionsApp() {
         <div className="panel"><div className="panelHead"><h2>API Key</h2><span className="badge">{state.keys.total}</span></div><div className="inlineForm"><input value={newKeyName} onChange={(e) => setNewKeyName(e.target.value)} placeholder="Key 名称" /><select value={newKeyGroupId} onChange={(e) => setNewKeyGroupId(e.target.value)}><option value="">不绑定分组</option>{state.groups.map((group) => <option key={group.id} value={group.id}>{group.name}{group.platform ? ` - ${group.platform}` : ""}</option>)}</select><button onClick={createKey} disabled={busy || !newKeyName}>创建</button></div><div className="list keys">{state.keys.items.length === 0 && <p className="muted">暂无 Key。请先创建或同步 API Key。</p>}{state.keys.items.map((item) => { const resolvedGroup = keyGroup(item, state.groups); const groupValue = editKeyGroupId[item.id] ?? (keyGroupId(item)?.toString() ?? ""); return <article className={"row selectable " + (selectedKey?.id === item.id ? "selected" : "")} key={item.id} onClick={() => chooseKey(item.id)}><div><strong>{item.name || `Key #${item.id}`}</strong><small>{item.status || "unknown"} - {resolvedGroup?.name || "未分组"} - {maskKey(item.key)}</small></div><div className="actions"><select value={groupValue} onChange={(e) => { e.stopPropagation(); setEditKeyGroupId((cur) => ({ ...cur, [item.id]: e.target.value })); void updateKeyGroup(item.id, e.target.value); }} onClick={(e) => e.stopPropagation()}><option value="">不绑定分组</option>{state.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select><button className="link" onClick={(e) => { e.stopPropagation(); void deleteKey(item.id); }}>删除</button></div></article>; })}</div></div>
       </section>
 
+      <section className="panel profilePanel">
+        <div className="panelHead"><h2>配置方案</h2><span className="badge">{profiles.length}</span></div>
+        <div className="profileComposer">
+          <input value={profileNameDraft} onChange={(event) => setProfileNameDraft(event.target.value)} placeholder="方案名称，例如：工作 / 测试 / 备用" maxLength={80} />
+          <button className="secondary" onClick={() => { void saveConfigProfile(); }} disabled={busy || profileBusyId !== null || !profileNameDraft.trim()}>保存为新方案</button>
+          {selectedProfile && <button onClick={() => { void saveConfigProfile(selectedProfile.id); }} disabled={busy || profileBusyId !== null || !profileDirty}>{profileBusyId === selectedProfile.id ? "保存中" : "覆盖保存 / 重命名"}</button>}
+        </div>
+        <p className="muted">方案保存端点、Key、模型、目标工具和路由规则。载入只修改表单，一键应用会立即执行配置事务。</p>
+        <div className="list profileList">
+          {profiles.length === 0 && <p className="muted">尚无配置方案。填写下方配置后保存即可复用。</p>}
+          {profiles.map((profile) => {
+            const referencedKey = profile.keyId == null ? null : state.keys.items.find((key) => key.id === profile.keyId);
+            const keyText = referencedKey?.name || (profile.keyId != null ? `Key #${profile.keyId}（当前不可用）` : profile.keyHint || "已保存手动 Key");
+            const routeText = profile.localRoutingEnabled ? `路由：${profile.localRouteApps.join(" / ") || "未选择"}` : "直连";
+            return <article className={"row profileRow " + (selectedProfileId === profile.id ? "selected" : "")} key={profile.id}><div><strong>{profile.name}</strong><small>{profile.tool} · {profile.baseUrl} · {profile.model || "默认模型"}</small><small>{keyText} · {routeText}</small></div><div className="actions"><button className="ghost mini" onClick={() => { void loadProfileIntoForm(profile); }} disabled={busy || profileBusyId !== null}>载入表单</button><button className="secondary mini" onClick={() => { void applyConfigProfile(profile); }} disabled={busy || profileBusyId !== null}>{profileBusyId === profile.id ? "处理中" : "一键应用"}</button><button className="ghost mini" onClick={() => { void deleteConfigProfile(profile); }} disabled={busy || profileBusyId !== null}>删除</button></div></article>;
+          })}
+        </div>
+      </section>
+
       <section className="panel switchPanel">
         <div className="panelHead"><h2>写入配置</h2><span className="badge">{selectedTool?.displayName ?? state.selectedTool}</span></div>
         <div className="switchGrid">
@@ -733,7 +968,7 @@ function CodexSessionsApp() {
           <label>接口 Base URL<div className="inputAction"><input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /><button className="secondary" onClick={probeBestEndpoint} disabled={probingEndpoint || busy}>{probingEndpoint ? "检测中" : "检测最优端点"}</button></div></label>
           {endpointProbe && <div className="wide endpointProbeResults">{endpointProbe.results.map((result) => <span className={result.selected ? "selectedEndpoint" : ""} key={result.domain}>{result.selected ? "已选 " : ""}{endpointProbeText(result)}</span>)}</div>}
           <label className="wide">API Key<input value={manualKey} onChange={(e) => setManualKey(e.target.value)} placeholder={selectedKey?.key ? "使用选中的 Key" : "sk-..."} /></label>
-          <label className="wide">模型选择（可选）<button className="secondary" onClick={testModels} disabled={testingModels || !effectiveKey || !baseUrl.trim()}>获取模型列表</button><select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)} disabled={models.length === 0 || testingModels}>{models.length === 0 ? <option value="">可不选</option> : null}{models.map((model) => <option key={model.id} value={model.id}>{model.id}{model.ownedBy ? ` - ${model.ownedBy}` : ""}</option>)}</select></label>
+          <label className="wide">模型选择（可选）<button className="secondary" onClick={testModels} disabled={testingModels || !effectiveKey || !baseUrl.trim()}>获取模型列表</button><select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)} disabled={testingModels}>{!selectedModel && models.length === 0 ? <option value="">可不选</option> : null}{selectedModel && !models.some((model) => model.id === selectedModel) ? <option value={selectedModel}>{selectedModel} - Profile</option> : null}{models.map((model) => <option key={model.id} value={model.id}>{model.id}{model.ownedBy ? ` - ${model.ownedBy}` : ""}</option>)}</select></label>
           <label className="wide checkboxLine"><input type="checkbox" checked={routeCodexEnabled} onChange={(e) => setRouteCodexEnabled(e.target.checked)} /> 启用 Codex 本地路由（127.0.0.1:15888/v1 / PROXY_MANAGED）</label>
           <label className="wide checkboxLine"><input type="checkbox" checked={routeClaudeEnabled} onChange={(e) => setRouteClaudeEnabled(e.target.checked)} /> 启用 Claude 本地路由（127.0.0.1:15888 / PROXY_MANAGED）</label>
           <label className="wide checkboxLine"><input type="checkbox" checked={routeOpenCodeEnabled} onChange={(e) => setRouteOpenCodeEnabled(e.target.checked)} /> 启用 OpenCode 本地路由（127.0.0.1:15888/v1 / PROXY_MANAGED）</label>
@@ -741,14 +976,28 @@ function CodexSessionsApp() {
           {localRoutingEnabled && <label className="wide checkboxLine"><input type="checkbox" checked={localRouteOnly} onChange={(e) => setLocalRouteOnly(e.target.checked)} /> 只接管路由，不写模型</label>}
         </div>
         {selectedTool && <p className="muted">将写入：{selectedTool.configPath}。{selectedTool.notes}</p>}
-        <div className="actions"><button onClick={writeSwitch} disabled={!canWrite || busy}>写入配置</button><button className="secondary" onClick={showPreview} disabled={busy || !effectiveKey}>预览目标</button><button className="ghost" onClick={copyKey} disabled={!effectiveKey}>复制 Key</button><button className="ghost" onClick={cleanupLocalRoute} disabled={busy}>清理本地路由</button><button className="ghost" onClick={restoreLocalRouteBackups} disabled={busy}>恢复备份</button></div>
+        <div className="actions"><button onClick={writeSwitch} disabled={!canWrite || busy}>写入配置</button><button className="secondary" onClick={showPreview} disabled={busy || !effectiveKey}>预览目标</button><button className="ghost" onClick={copyKey} disabled={!effectiveKey}>复制 Key</button><button className="ghost" onClick={cleanupLocalRoute} disabled={busy}>清理本地路由</button><button className="ghost" onClick={restoreLocalRouteBackups} disabled={busy}>恢复旧版备份</button></div>
+      </section>
+
+      <section className="panel configHistory">
+        <div className="panelHead"><h2>配置历史</h2><span className="badge">{configSnapshots.length}</span></div>
+        <div className="list">
+          {configSnapshots.length === 0 && <p className="muted">首次成功写入配置后会生成可回滚快照。</p>}
+          {configSnapshots.map((snapshot) => <article className="row" key={snapshot.id}><div><strong>{snapshot.label}</strong><small>{safeTimestamp(snapshot.createdAt)} · {snapshot.files.length} 个文件</small></div><button className="ghost mini" onClick={() => { void restoreConfigSnapshot(snapshot.id); }} disabled={busy || restoringSnapshotId !== null}>{restoringSnapshotId === snapshot.id ? "恢复中" : "回滚"}</button></article>)}
+        </div>
       </section>
 
       {preview.length > 0 && <section className="panel"><div className="panelHead"><h2>写入目标</h2></div><div className="list">{preview.map(([path, label]) => <article className="row" key={path}><div><strong>{label}</strong><small>{path}</small></div></article>)}</div></section>}
       {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
             <footer className="appFooter">
-        <div>v0.0.4 Copyright AI8888.SHOP 2026</div>
-        <div className="footerActions"><button className="ghost mini" onClick={() => { void checkUpdate(); }} disabled={checkingUpdate}>{checkingUpdate ? "检查中" : "检查更新"}</button>{(updateInfo?.downloadUrl || updateInfo?.releaseUrl) && <a href={updateInfo.downloadUrl || updateInfo.releaseUrl || "#"} target="_blank" rel="noreferrer">{updateInfo.updateAvailable ? (updateInfo.downloadUrl ? (updateInfo.downloadAccelerated ? "加速下载新版本" : "下载新版本") : "查看新版本") : "GitHub Releases"}</a>}{updateInfo?.updateAvailable && updateInfo?.releaseUrl && updateInfo?.downloadUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">发布页</a>}</div>
+        <div>v0.0.5 Copyright AI8888.SHOP 2026</div>
+        <div className="footerActions">
+          <button className="ghost mini" onClick={() => { void checkUpdate(); }} disabled={checkingUpdate || installingUpdate}>{checkingUpdate ? "检查中" : "检查更新"}</button>
+          {updateInfo?.updateAvailable && updateInfo.downloadUrl && <button className="secondary mini" onClick={() => { void installUpdate(); }} disabled={checkingUpdate || installingUpdate}>{installingUpdate ? "正在下载安装" : "下载并安装"}</button>}
+          {(updateInfo?.downloadUrl || updateInfo?.releaseUrl) && <a href={updateInfo.downloadUrl || updateInfo.releaseUrl || "#"} target="_blank" rel="noreferrer">{updateInfo.updateAvailable ? (updateInfo.downloadUrl ? (updateInfo.downloadAccelerated ? "加速下载链接" : "直接下载链接") : "查看新版本") : "GitHub Releases"}</a>}
+          {updateInfo?.updateAvailable && updateInfo?.releaseUrl && updateInfo?.downloadUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">发布页</a>}
+        </div>
+        {updateProgress && installingUpdate && <div className="updateProgress"><div><strong>{updateProgress.message}</strong><small>{updateProgress.totalBytes > 0 ? `${bytesLabel(updateProgress.downloadedBytes)} / ${bytesLabel(updateProgress.totalBytes)} · ${updateProgress.percent.toFixed(1)}%` : "正在连接"}</small></div><progress max="100" value={updateProgress.percent} />{["preparing", "downloading", "fallback"].includes(updateProgress.status) && <button className="ghost mini" onClick={() => { void cancelUpdate(); }}>取消</button>}</div>}
         {updateInfo && <div className="muted">{updateInfo.updateAvailable ? `发现新版本 ${updateInfo.latestVersion}${updateInfo.downloadAccelerated ? "（已启用 GitHub 加速下载）" : updateInfo.mainlandChina ? "（大陆网络，未找到安装包资源）" : ""}` : updateInfo.error ? `更新检查失败：${updateInfo.error}` : `当前已是最新版本 ${updateInfo.currentVersion}`}</div>}
         <div className="credits">{"\u81f4\u8c22\u5f00\u6e90\u9879\u76ee\uff1a"}<a href="https://github.com/jlcodes99/cockpit-tools" target="_blank" rel="noreferrer">cockpit-tools</a><a href="https://github.com/jlcodes99/cc-switch" target="_blank" rel="noreferrer">cc-switch</a><a href="https://github.com/Wei-Shaw/sub2api" target="_blank" rel="noreferrer">sub2api</a></div>
       </footer>

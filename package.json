@@ -1,6 +1,6 @@
 {
   "name": "ai8888-switch",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "AI8888 Switch desktop client",
   "type": "module",
   "scripts": {
@@ -10,11 +10,12 @@
     "dev:renderer": "vite --host 127.0.0.1",
     "build:renderer": "vite build",
     "typecheck": "tsc --noEmit",
-    "test:renderer-logic": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Remove-Item -Recurse -Force D:\\tmp\\ai8888-renderer-test -ErrorAction SilentlyContinue; tsc --target ES2020 --module CommonJS --moduleResolution Node --skipLibCheck --strict --outDir D:\\tmp\\ai8888-renderer-test src/subscription.ts tests/subscription.test.ts; node D:\\tmp\\ai8888-renderer-test\\tests\\subscription.test.js\"",
+    "test:renderer-logic": "node scripts/run-renderer-tests.mjs",
     "build:app": "tauri build --no-bundle",
+    "verify:version": "node scripts/verify-version.mjs",
     "test": "npm run test:renderer-logic && cargo test -q --manifest-path src-tauri\\Cargo.toml",
     "check": "npm run typecheck && cargo check -q --manifest-path src-tauri\\Cargo.toml",
-    "verify": "npm run test && npm run check && npm run build:renderer"
+    "verify": "npm run verify:version && npm run test && npm run check && npm run build:renderer"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

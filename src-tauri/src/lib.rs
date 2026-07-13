@@ -1,6 +1,8 @@
 mod api;
 mod codex_sessions;
 mod config;
+mod config_profiles;
+mod config_transaction;
 mod error;
 mod local_proxy;
 mod models;
@@ -11,24 +13,35 @@ use std::collections::HashMap;
 use api::{ApiClient, CreateKeyPayload, LoginPayload, ModelsQuery, RefreshPayload, UpdateKeyPayload};
 use codex_sessions::{CodexSessionMessage, CodexSessionMeta, CodexSessionSearchHit, CodexSessionSearchRequest, CodexSessionVisibilityRepairOutcome, CodexSessionVisibilityRepairRequest};
 use config::{ensure_app_dir, local_route_manifest_path, preferences_path, read_json, state_path, updates_dir, write_json, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL};
+use config_profiles::{delete_profile, list_profiles, resolve_profile_target, save_profile};
+use config_transaction::{create_snapshot, list_snapshots, prune_snapshots, remove_snapshot, restore_snapshot, rollback_failed_transaction};
 use error::AppError;
 use local_proxy::ensure_local_proxy;
-use models::{AccountSummary, ApiKeySummary, AppPreferences, AppStateData, EndpointProbeSummary, GroupSummary, LocalRouteManifest, LocalRouteStatus, LoginResult, ModelSummary, Pagination, StoredSession, SubscriptionSummary, SwitchTarget, ToolProfile, UpdateCheckResult, UpdateInstallResult};
+use models::{AccountSummary, ApiKeySummary, AppPreferences, AppStateData, ConfigProfile, ConfigProfileInput, ConfigSnapshotSummary, ConfigTransactionResult, EndpointProbeSummary, GroupSummary, LocalRouteManifest, LocalRouteStatus, LoginResult, ModelSummary, Pagination, StoredSession, SubscriptionSummary, SwitchTarget, ToolProfile, UpdateCheckResult, UpdateDownloadProgress, UpdateInstallResult};
+use sha2::{Digest, Sha256};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, State};
-use tokio::sync::RwLock;
-use tools::{build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
+use tauri::{Emitter, Manager, State};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{watch, Mutex, RwLock};
+use tools::{all_managed_config_paths, build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, managed_paths_for_route_cleanup, managed_paths_for_target, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
 
-const CURRENT_APP_VERSION: &str = "v0.0.4";
+const CURRENT_APP_VERSION: &str = "v0.0.5";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
 const TRAY_QUIT_ID: &str = "tray-quit";
 
+struct UpdateDownloadControl {
+  task_id: String,
+  cancel: watch::Sender<bool>,
+}
+
 pub struct SharedState {
   pub api: ApiClient,
   pub data: RwLock<AppStateData>,
+  update_download: std::sync::Mutex<Option<UpdateDownloadControl>>,
+  config_transaction: Mutex<()>,
 }
 
 impl SharedState {
@@ -39,6 +52,8 @@ impl SharedState {
         selected_tool: ToolKind::Codex.as_str().to_string(),
         ..Default::default()
       }),
+      update_download: std::sync::Mutex::new(None),
+      config_transaction: Mutex::new(()),
     })
   }
 }
@@ -186,75 +201,184 @@ async fn app_dismiss_alert(alert_id: String) -> Result<AppPreferences, String> {
 }
 
 #[tauri::command]
-async fn app_install_update(download_url: String) -> Result<UpdateInstallResult, String> {
-  let url = download_url.trim().to_string();
-  if url.is_empty() {
-    return Ok(UpdateInstallResult {
-      success: false,
-      installer_path: None,
-      launched: false,
-      message: "缺少下载地址".into(),
-    });
+async fn app_install_update(
+  app: tauri::AppHandle,
+  state: State<'_, SharedState>,
+  version: String,
+  prefer_accelerated: bool,
+) -> Result<UpdateInstallResult, String> {
+  let version = version.trim();
+  if version.is_empty() || version.chars().any(|ch| ch.is_control() || ch == '/' || ch == '\\') {
+    return Err("invalid update version".into());
   }
-  if !(url.starts_with("https://") || url.starts_with("http://")) {
-    return Ok(UpdateInstallResult {
-      success: false,
-      installer_path: None,
-      launched: false,
-      message: "下载地址无效".into(),
-    });
+
+  let task_id = format!("{}-{}", now_epoch_ms(), std::process::id());
+  let (cancel_sender, cancel_receiver) = watch::channel(false);
+  {
+    let mut active = state.update_download.lock().map_err(|_| "update download state is unavailable".to_string())?;
+    if active.is_some() {
+      return Err("an update download is already running".into());
+    }
+    *active = Some(UpdateDownloadControl { task_id: task_id.clone(), cancel: cancel_sender });
   }
+  emit_update_progress(&app, &task_id, "preparing", 0, 0, "正在准备更新");
+
+  let outcome = run_update_install(&app, &task_id, version, prefer_accelerated, cancel_receiver).await;
+  {
+    let mut active = state.update_download.lock().map_err(|_| "update download state is unavailable".to_string())?;
+    if active.as_ref().map(|item| item.task_id.as_str()) == Some(task_id.as_str()) {
+      *active = None;
+    }
+  }
+
+  match &outcome {
+    Ok(result) => emit_update_progress(&app, &task_id, "completed", 1, 1, &result.message),
+    Err(error) if error == UPDATE_CANCELED_ERROR => emit_update_progress(&app, &task_id, "canceled", 0, 0, "更新下载已取消"),
+    Err(error) => emit_update_progress(&app, &task_id, "failed", 0, 0, error),
+  }
+  if outcome.as_ref().map(|result| result.launched).unwrap_or(false) {
+    app.exit(0);
+  }
+  outcome
+}
+
+#[tauri::command]
+fn app_cancel_update(state: State<'_, SharedState>) -> Result<bool, String> {
+  let active = state.update_download.lock().map_err(|_| "update download state is unavailable".to_string())?;
+  if let Some(control) = active.as_ref() {
+    control.cancel.send(true).map_err(|_| "update download has already stopped".to_string())?;
+    Ok(true)
+  } else {
+    Ok(false)
+  }
+}
+
+const UPDATE_CANCELED_ERROR: &str = "update download canceled";
+
+fn now_epoch_ms() -> u64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|value| value.as_millis() as u64)
+    .unwrap_or(0)
+}
+
+fn emit_update_progress(app: &tauri::AppHandle, task_id: &str, status: &str, downloaded_bytes: u64, total_bytes: u64, message: &str) {
+  let percent = if total_bytes == 0 { 0.0 } else { (downloaded_bytes as f64 / total_bytes as f64 * 100.0).clamp(0.0, 100.0) };
+  let _ = app.emit("update-download-progress", UpdateDownloadProgress {
+    task_id: task_id.to_string(),
+    status: status.to_string(),
+    downloaded_bytes,
+    total_bytes,
+    percent,
+    message: message.to_string(),
+  });
+}
+
+async fn run_update_install(
+  app: &tauri::AppHandle,
+  task_id: &str,
+  version: &str,
+  prefer_accelerated: bool,
+  mut cancel: watch::Receiver<bool>,
+) -> Result<UpdateInstallResult, String> {
+  let client = reqwest::Client::builder()
+    .user_agent("AI8888-tools-update-install")
+    .connect_timeout(std::time::Duration::from_secs(15))
+    .timeout(std::time::Duration::from_secs(30 * 60))
+    .build()
+    .map_err(|err| err.to_string())?;
+  let release_request = fetch_latest_update_release(&client);
+  tokio::pin!(release_request);
+  let release = tokio::select! {
+    result = &mut release_request => result?,
+    _ = cancel.changed() => return Err(UPDATE_CANCELED_ERROR.into()),
+  };
+  let latest_version = release
+    .get("tag_name")
+    .and_then(serde_json::Value::as_str)
+    .ok_or_else(|| "latest GitHub release has no tag name".to_string())?;
+  if latest_version != version {
+    return Err(format!("requested update {version} is no longer the latest release ({latest_version})"));
+  }
+
+  let asset = select_release_asset(&release)
+    .ok_or_else(|| format!("no installer asset is available for {}", current_os_family()))?;
+  validate_release_asset(&asset, version)?;
 
   ensure_app_dir().map_err(|err| err.to_string())?;
   let updates = updates_dir();
-  std::fs::create_dir_all(&updates).map_err(|err| err.to_string())?;
-
-  let file_name = url
-    .split('?')
-    .next()
-    .unwrap_or(&url)
-    .rsplit('/')
-    .next()
-    .unwrap_or("ai8888-switch-update.bin")
-    .replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_");
-  let target = updates.join(file_name);
-
-  let client = reqwest::Client::builder()
-    .user_agent("AI8888-tools-update-install")
-    .timeout(std::time::Duration::from_secs(180))
-    .build()
-    .map_err(|err| err.to_string())?;
-  let response = client.get(&url).send().await.map_err(|err| err.to_string())?;
-  if !response.status().is_success() {
-    return Ok(UpdateInstallResult {
-      success: false,
-      installer_path: None,
-      launched: false,
-      message: format!("下载失败: HTTP {}", response.status()),
-    });
+  tokio::fs::create_dir_all(&updates).await.map_err(|err| err.to_string())?;
+  cleanup_stale_update_parts(&updates).await;
+  let target = updates.join(&asset.name);
+  let partial = updates.join(format!(".{}.{}.part", asset.name, task_id));
+  let accelerated_url = accelerate_github_download_url(&asset.download_url);
+  let download = if prefer_accelerated {
+    match download_update_asset(app, task_id, &client, &accelerated_url, asset.size, &partial, &mut cancel, "正在通过加速线路下载").await {
+      Ok(digest) => Ok(digest),
+      Err(error) if error == UPDATE_CANCELED_ERROR => Err(error),
+      Err(accelerated_error) => {
+        emit_update_progress(app, task_id, "fallback", 0, asset.size, "加速线路失败，正在切换直接下载");
+        match download_update_asset(app, task_id, &client, &asset.download_url, asset.size, &partial, &mut cancel, "正在通过 GitHub 直接下载").await {
+          Err(error) if error == UPDATE_CANCELED_ERROR => Err(error),
+          Err(direct_error) => Err(format!("accelerated download failed ({accelerated_error}); direct download failed ({direct_error})")),
+          Ok(digest) => Ok(digest),
+        }
+      }
+    }
+  } else {
+    download_update_asset(app, task_id, &client, &asset.download_url, asset.size, &partial, &mut cancel, "正在通过 GitHub 直接下载").await
+  };
+  let actual_digest = match download {
+    Ok(digest) => digest,
+    Err(error) => {
+      let _ = tokio::fs::remove_file(&partial).await;
+      return Err(error);
+    }
+  };
+  emit_update_progress(app, task_id, "verifying", asset.size, asset.size, "正在校验安装包");
+  if let Err(error) = verify_update_digest_hex(&actual_digest, asset.digest.as_deref()) {
+    let _ = tokio::fs::remove_file(&partial).await;
+    return Err(error);
   }
-  let bytes = response.bytes().await.map_err(|err| err.to_string())?;
-  if bytes.len() < 1024 {
-    return Ok(UpdateInstallResult {
-      success: false,
-      installer_path: None,
-      launched: false,
-      message: "下载内容过小，可能不是有效安装包".into(),
-    });
+  if *cancel.borrow() {
+    let _ = tokio::fs::remove_file(&partial).await;
+    return Err(UPDATE_CANCELED_ERROR.into());
   }
-  std::fs::write(&target, &bytes).map_err(|err| err.to_string())?;
+  if target.exists() {
+    if let Err(error) = tokio::fs::remove_file(&target).await {
+      let _ = tokio::fs::remove_file(&partial).await;
+      return Err(error.to_string());
+    }
+  }
+  if let Err(error) = tokio::fs::rename(&partial, &target).await {
+    let _ = tokio::fs::remove_file(&partial).await;
+    return Err(error.to_string());
+  }
 
+  emit_update_progress(app, task_id, "launching", asset.size, asset.size, "安装包校验完成，正在启动");
   let launched = launch_installer(&target)?;
   Ok(UpdateInstallResult {
     success: true,
     installer_path: Some(target.display().to_string()),
     launched,
     message: if launched {
-      "已下载并启动安装程序，请按提示完成更新".into()
+      "update verified; installer launched".into()
     } else {
-      format!("已下载安装包：{}", target.display())
+      format!("update verified and downloaded to {}", target.display())
     },
   })
+}
+
+async fn cleanup_stale_update_parts(updates: &std::path::Path) {
+  let Ok(mut entries) = tokio::fs::read_dir(updates).await else { return; };
+  while let Ok(Some(entry)) = entries.next_entry().await {
+    let file_name = entry.file_name();
+    let name = file_name.to_string_lossy();
+    let is_partial = name.starts_with('.') && name.ends_with(".part");
+    if is_partial {
+      let _ = tokio::fs::remove_file(entry.path()).await;
+    }
+  }
 }
 
 fn launch_installer(path: &std::path::Path) -> Result<bool, String> {
@@ -280,19 +404,35 @@ fn launch_installer(path: &std::path::Path) -> Result<bool, String> {
 
   #[cfg(target_os = "macos")]
   {
-    match std::process::Command::new("open").arg(path).spawn() {
-      Ok(_) => Ok(true),
+    match std::process::Command::new("open").arg(path).status() {
+      Ok(status) if status.success() => Ok(true),
+      Ok(status) => Err(format!("安装包打开失败，open 退出状态: {status}")),
       Err(err) => Err(format!("安装包打开失败: {err}")),
     }
   }
 
   #[cfg(target_os = "linux")]
   {
-    // Best effort: open with xdg-open; deb/rpm/AppImage may need manual install.
-    match std::process::Command::new("xdg-open").arg(path).spawn() {
-      Ok(_) => Ok(true),
-      Err(err) => Err(format!("安装包打开失败: {err}")),
+    use std::os::unix::fs::PermissionsExt;
+    let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    if name.ends_with(".appimage") {
+      let metadata = std::fs::metadata(path).map_err(|err| format!("无法读取 AppImage 权限: {err}"))?;
+      let mut permissions = metadata.permissions();
+      permissions.set_mode(permissions.mode() | 0o111);
+      std::fs::set_permissions(path, permissions).map_err(|err| format!("无法设置 AppImage 执行权限: {err}"))?;
+      return std::process::Command::new(path)
+        .spawn()
+        .map(|_| true)
+        .map_err(|err| format!("AppImage 启动失败: {err}"));
     }
+    if name.ends_with(".deb") || name.ends_with(".rpm") {
+      return std::process::Command::new("xdg-open")
+        .arg(path)
+        .status()
+        .map_err(|err| format!("系统安装器打开失败: {err}"))
+        .and_then(|status| status.success().then_some(true).ok_or_else(|| format!("系统安装器打开失败，xdg-open 退出状态: {status}")));
+    }
+    Err("不支持当前 Linux 更新包格式".into())
   }
 
   #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -323,26 +463,146 @@ fn accelerate_github_download_url(url: &str) -> String {
   format!("{GITHUB_DOWNLOAD_ACCELERATOR_PREFIX}{trimmed}")
 }
 
-fn select_release_download_url(release: &serde_json::Value) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseAsset {
+  name: String,
+  download_url: String,
+  size: u64,
+  digest: Option<String>,
+}
+
+async fn fetch_latest_update_release(client: &reqwest::Client) -> Result<serde_json::Value, String> {
+  let url = format!("https://api.github.com/repos/{GITHUB_UPDATE_REPOSITORY}/releases/latest");
+  let response = client.get(url).send().await.map_err(|err| err.to_string())?;
+  let status = response.status();
+  let text = response.text().await.map_err(|err| err.to_string())?;
+  if !status.is_success() {
+    return Err(format!("GitHub releases returned {status}: {}", text.chars().take(200).collect::<String>()));
+  }
+  serde_json::from_str(&text).map_err(|err| err.to_string())
+}
+
+fn select_release_asset(release: &serde_json::Value) -> Option<ReleaseAsset> {
   let assets = release.get("assets").and_then(serde_json::Value::as_array)?;
   let mut candidates = Vec::new();
   for asset in assets {
-    let name = asset.get("name").and_then(serde_json::Value::as_str).unwrap_or("").to_ascii_lowercase();
-    let url = asset
-      .get("browser_download_url")
-      .and_then(serde_json::Value::as_str)
-      .unwrap_or("")
-      .to_string();
-    if url.is_empty() {
+    let name = asset.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+    let download_url = asset.get("browser_download_url").and_then(serde_json::Value::as_str).unwrap_or("");
+    let score = score_release_asset(&name.to_ascii_lowercase());
+    if download_url.is_empty() || score <= 0 {
       continue;
     }
-    let score = score_release_asset(&name);
-    if score > 0 {
-      candidates.push((score, url));
-    }
+    candidates.push((score, ReleaseAsset {
+      name: name.to_string(),
+      download_url: download_url.to_string(),
+      size: asset.get("size").and_then(serde_json::Value::as_u64).unwrap_or(0),
+      digest: asset.get("digest").and_then(serde_json::Value::as_str).map(str::to_string),
+    }));
   }
   candidates.sort_by(|left, right| right.0.cmp(&left.0));
-  candidates.into_iter().map(|(_, url)| url).next()
+  candidates.into_iter().map(|(_, asset)| asset).next()
+}
+
+fn select_release_download_url(release: &serde_json::Value) -> Option<String> {
+  select_release_asset(release).map(|asset| asset.download_url)
+}
+
+async fn download_update_asset(
+  app: &tauri::AppHandle,
+  task_id: &str,
+  client: &reqwest::Client,
+  url: &str,
+  expected_size: u64,
+  partial: &std::path::Path,
+  cancel: &mut watch::Receiver<bool>,
+  message: &str,
+) -> Result<String, String> {
+  if *cancel.borrow() {
+    return Err(UPDATE_CANCELED_ERROR.into());
+  }
+  let request = client.get(url).send();
+  tokio::pin!(request);
+  let mut response = tokio::select! {
+    result = &mut request => result.map_err(|err| err.to_string())?,
+    _ = cancel.changed() => return Err(UPDATE_CANCELED_ERROR.into()),
+  };
+  if !response.status().is_success() {
+    return Err(format!("HTTP {}", response.status()));
+  }
+  if let Some(content_length) = response.content_length() {
+    if content_length != expected_size {
+      return Err(format!("installer content length mismatch: expected {expected_size}, received {content_length}"));
+    }
+  }
+
+  let mut file = tokio::fs::File::create(partial).await.map_err(|err| err.to_string())?;
+  let mut digest = Sha256::new();
+  let mut downloaded = 0_u64;
+  let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+  emit_update_progress(app, task_id, "downloading", 0, expected_size, message);
+  loop {
+    let chunk = tokio::select! {
+      result = response.chunk() => result.map_err(|err| err.to_string())?,
+      _ = cancel.changed() => return Err(UPDATE_CANCELED_ERROR.into()),
+    };
+    let Some(chunk) = chunk else { break; };
+    downloaded = downloaded.saturating_add(chunk.len() as u64);
+    if downloaded > expected_size {
+      return Err(format!("installer exceeded expected size: expected {expected_size}, received at least {downloaded}"));
+    }
+    file.write_all(&chunk).await.map_err(|err| err.to_string())?;
+    digest.update(&chunk);
+    if last_emit.elapsed() >= std::time::Duration::from_millis(150) || downloaded == expected_size {
+      emit_update_progress(app, task_id, "downloading", downloaded, expected_size, message);
+      last_emit = std::time::Instant::now();
+    }
+  }
+  file.flush().await.map_err(|err| err.to_string())?;
+  file.sync_all().await.map_err(|err| err.to_string())?;
+  if downloaded != expected_size {
+    return Err(format!("installer size mismatch: expected {expected_size}, received {downloaded}"));
+  }
+  Ok(format!("{:x}", digest.finalize()))
+}
+
+fn validate_release_asset(asset: &ReleaseAsset, version: &str) -> Result<(), String> {
+  let file_name = std::path::Path::new(&asset.name).file_name().and_then(|value| value.to_str());
+  if asset.name.is_empty() || asset.name.contains(['/', '\\']) || file_name != Some(asset.name.as_str()) {
+    return Err("invalid update asset name".into());
+  }
+  let expected_prefix = format!("https://github.com/{GITHUB_UPDATE_REPOSITORY}/releases/download/{version}/");
+  if !asset.download_url.starts_with(&expected_prefix) {
+    return Err("update asset URL is outside the configured GitHub repository or release".into());
+  }
+  if asset.size < 1024 {
+    return Err("GitHub reported an invalid installer size".into());
+  }
+  expected_sha256(asset.digest.as_deref())?;
+  Ok(())
+}
+
+fn expected_sha256(digest: Option<&str>) -> Result<&str, String> {
+  let expected = digest
+    .and_then(|value| value.strip_prefix("sha256:"))
+    .ok_or_else(|| "GitHub did not provide a SHA-256 digest for the update asset".to_string())?;
+  if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    return Err("GitHub provided an invalid SHA-256 digest for the update asset".into());
+  }
+  Ok(expected)
+}
+
+fn verify_update_digest(bytes: &[u8], digest: Option<&str>) -> Result<(), String> {
+  let actual = format!("{:x}", Sha256::digest(bytes));
+  verify_update_digest_hex(&actual, digest)
+}
+
+fn verify_update_digest_hex(actual: &str, digest: Option<&str>) -> Result<(), String> {
+  let expected = expected_sha256(digest)?;
+  if actual.eq_ignore_ascii_case(expected) {
+    Ok(())
+  } else {
+    Err("downloaded installer SHA-256 digest does not match GitHub metadata".into())
+  }
 }
 
 fn current_os_family() -> &'static str {
@@ -358,31 +618,29 @@ fn current_os_family() -> &'static str {
 }
 
 fn score_release_asset(name: &str) -> i32 {
-  // Prefer installers for the current desktop OS; still allow cross-platform assets as fallback.
-  let os = current_os_family();
+  score_release_asset_for(current_os_family(), std::env::consts::ARCH, name)
+}
+
+fn score_release_asset_for(os: &str, host_arch: &str, name: &str) -> i32 {
   let mut score = 0;
 
   let is_windows = name.ends_with(".msi")
     || name.ends_with("-setup.exe")
     || name.ends_with("setup.exe")
     || name.ends_with(".exe");
-  let is_macos = name.ends_with(".dmg") || name.ends_with(".pkg") || name.ends_with(".app.tar.gz");
+  let is_macos = name.ends_with(".dmg") || name.ends_with(".pkg");
   let is_linux = name.ends_with(".appimage")
     || name.ends_with(".deb")
-    || name.ends_with(".rpm")
-    || name.ends_with(".tar.gz")
-    || name.ends_with(".tgz");
+    || name.ends_with(".rpm");
 
   match os {
     "windows" => {
-      if name.ends_with(".msi") {
+      if name.ends_with("-setup.exe") || name.ends_with("setup.exe") {
         score += 120;
-      } else if name.ends_with("-setup.exe") || name.ends_with("setup.exe") {
-        score += 115;
+      } else if name.ends_with(".msi") {
+        score += 110;
       } else if name.ends_with(".exe") {
         score += 100;
-      } else if is_macos || is_linux {
-        score += 10; // keep as last-resort fallback
       } else {
         return 0;
       }
@@ -392,25 +650,20 @@ fn score_release_asset(name: &str) -> i32 {
         score += 120;
       } else if name.ends_with(".pkg") {
         score += 110;
-      } else if name.ends_with(".app.tar.gz") {
-        score += 100;
-      } else if is_windows || is_linux {
-        score += 10;
       } else {
         return 0;
       }
     }
     "linux" => {
+      let running_appimage = std::env::var_os("APPIMAGE").is_some();
+      let debian_family = std::path::Path::new("/usr/bin/dpkg").exists();
+      let rpm_family = std::path::Path::new("/usr/bin/rpm").exists();
       if name.ends_with(".appimage") {
-        score += 120;
+        score += if running_appimage || (!debian_family && !rpm_family) { 120 } else { 100 };
       } else if name.ends_with(".deb") {
-        score += 110;
+        score += if debian_family && !running_appimage { 120 } else { 90 };
       } else if name.ends_with(".rpm") {
-        score += 105;
-      } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        score += 90;
-      } else if is_windows || is_macos {
-        score += 10;
+        score += if rpm_family && !running_appimage { 120 } else { 90 };
       } else {
         return 0;
       }
@@ -425,19 +678,18 @@ fn score_release_asset(name: &str) -> i32 {
   }
 
   // Architecture preference.
-  let host_arch = std::env::consts::ARCH;
   if host_arch == "x86_64" && (name.contains("x64") || name.contains("amd64") || name.contains("x86_64") || name.contains("win64")) {
     score += 20;
   }
   if host_arch == "aarch64" && (name.contains("arm64") || name.contains("aarch64")) {
     score += 20;
   }
-  // Mild penalty for mismatched arch markers.
-  if host_arch == "x86_64" && (name.contains("arm64") || name.contains("aarch64")) {
-    score -= 25;
+  // Never install a package that explicitly targets another architecture.
+  if host_arch == "x86_64" && (name.contains("arm64") || name.contains("aarch64")) && !name.contains("universal") {
+    return 0;
   }
   if host_arch == "aarch64" && (name.contains("x64") || name.contains("amd64") || name.contains("x86_64")) && !name.contains("universal") {
-    score -= 25;
+    return 0;
   }
   if name.contains("universal") {
     score += 15;
@@ -450,11 +702,12 @@ fn score_release_asset(name: &str) -> i32 {
 
 #[cfg(test)]
 mod update_download_tests {
-  use super::{accelerate_github_download_url, score_release_asset, GITHUB_DOWNLOAD_ACCELERATOR_PREFIX};
+  use sha2::{Digest, Sha256};
+  use super::{accelerate_github_download_url, score_release_asset, score_release_asset_for, validate_release_asset, verify_update_digest, ReleaseAsset, GITHUB_DOWNLOAD_ACCELERATOR_PREFIX};
 
   #[test]
   fn accelerates_github_download_url() {
-    let original = "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.4/AI8888.Switch_0.0.4_x64-setup.exe";
+    let original = "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.5/AI8888.Switch_0.0.5_x64-setup.exe";
     let accelerated = accelerate_github_download_url(original);
     assert_eq!(accelerated, format!("{GITHUB_DOWNLOAD_ACCELERATOR_PREFIX}{original}"));
     assert_eq!(accelerate_github_download_url(&accelerated), accelerated);
@@ -462,16 +715,52 @@ mod update_download_tests {
 
   #[test]
   fn scores_current_platform_installers_positive() {
-    // At least one common installer type should score > 0 on every desktop OS build.
     let samples = [
-      "ai8888-switch_0.0.4_x64-setup.exe",
-      "AI8888 Switch_0.0.4_x64_en-US.msi",
-      "AI8888.Switch_0.0.4_x64.dmg",
-      "ai8888-switch_0.0.4_amd64.AppImage",
-      "ai8888-switch_0.0.4_amd64.deb",
-      "ai8888-switch-0.0.4-1.x86_64.rpm",
+      "ai8888-switch_0.0.5_x64-setup.exe",
+      "AI8888 Switch_0.0.5_x64_en-US.msi",
+      "AI8888.Switch_0.0.5_x64.dmg",
+      "ai8888-switch_0.0.5_amd64.AppImage",
+      "ai8888-switch_0.0.5_amd64.deb",
+      "ai8888-switch-0.0.5-1.x86_64.rpm",
     ];
     assert!(samples.iter().any(|name| score_release_asset(&name.to_ascii_lowercase()) > 50));
+  }
+
+  #[test]
+  fn rejects_installers_for_another_operating_system_or_architecture() {
+    assert!(score_release_asset_for("windows", "x86_64", "ai8888.switch_0.0.5_x64-setup.exe") > 0);
+    assert!(score_release_asset_for("macos", "aarch64", "ai8888.switch_0.0.5_universal.dmg") > 0);
+    assert!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.5_amd64.appimage") > 0);
+    assert_eq!(score_release_asset_for("windows", "x86_64", "ai8888.switch_0.0.5_universal.dmg"), 0);
+    assert_eq!(score_release_asset_for("macos", "aarch64", "ai8888.switch_0.0.5_x64-setup.exe"), 0);
+    assert_eq!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.5_universal.dmg"), 0);
+    assert_eq!(score_release_asset_for("windows", "aarch64", "ai8888.switch_0.0.5_x64-setup.exe"), 0);
+    assert_eq!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.5_aarch64.appimage"), 0);
+  }
+
+  #[test]
+  fn validates_repository_release_size_and_digest() {
+    let digest = format!("sha256:{:x}", Sha256::digest(b"installer"));
+    let asset = ReleaseAsset {
+      name: "AI8888.Switch_0.0.5_x64-setup.exe".into(),
+      download_url: "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.5/AI8888.Switch_0.0.5_x64-setup.exe".into(),
+      size: 4096,
+      digest: Some(digest),
+    };
+    assert!(validate_release_asset(&asset, "v0.0.5").is_ok());
+    let mut wrong_repository = asset.clone();
+    wrong_repository.download_url = wrong_repository.download_url.replace("AI8888-SHOP", "untrusted");
+    assert!(validate_release_asset(&wrong_repository, "v0.0.5").is_err());
+    let mut missing_digest = asset;
+    missing_digest.digest = None;
+    assert!(validate_release_asset(&missing_digest, "v0.0.5").is_err());
+  }
+
+  #[test]
+  fn verifies_sha256_digest() {
+    let digest = format!("sha256:{:x}", Sha256::digest(b"installer"));
+    assert!(verify_update_digest(b"installer", Some(&digest)).is_ok());
+    assert!(verify_update_digest(b"tampered", Some(&digest)).is_err());
   }
 }
 
@@ -999,15 +1288,115 @@ async fn app_prepare_switch(state: State<'_, SharedState>, tool: String, base_ur
 }
 
 #[tauri::command]
-async fn app_write_switch(target: SwitchTarget) -> Result<Vec<(String, String)>, String> {
+async fn app_write_switch(state: State<'_, SharedState>, target: SwitchTarget) -> Result<ConfigTransactionResult, String> {
+  let _transaction_guard = state.config_transaction.lock().await;
+  write_switch_transaction(&target).await
+}
+
+async fn write_switch_transaction(target: &SwitchTarget) -> Result<ConfigTransactionResult, String> {
   if target.api_key.trim().is_empty() {
     return Err("API Key cannot be empty".into());
   }
-  write_local_routed_targets(&target).map_err(|err| err.to_string())?;
-  if target.local_routing_enabled {
-    ensure_local_proxy(&target).await.map_err(|err| err.to_string())?;
+
+  let managed = managed_paths_for_target(&target);
+  let allowed = all_managed_config_paths();
+  let snapshot = create_snapshot(&managed, &format!("写入 {} 配置前", target.profile_name)).map_err(|err| err.to_string())?;
+  let transaction = match write_local_routed_targets(&target) {
+    Ok(()) if target.local_routing_enabled => ensure_local_proxy(&target).await.map_err(|err| err.to_string()),
+    Ok(()) => Ok(()),
+    Err(error) => Err(error.to_string()),
+  };
+
+  if let Err(error) = transaction {
+    match rollback_failed_transaction(&snapshot.id, &allowed) {
+      Ok(()) => {
+        let _ = remove_snapshot(&snapshot.id);
+        return Err(format!("配置事务失败，已自动回滚：{error}"));
+      }
+      Err(rollback_error) => {
+        return Err(format!("配置事务失败且自动回滚失败：{error}；回滚错误：{rollback_error}；快照 {} 已保留", snapshot.id));
+      }
+    }
   }
-  Ok(build_tool_preview(&target))
+
+  let _ = prune_snapshots(&[snapshot.id.as_str()]);
+  let artifacts = build_tool_preview(&target);
+  Ok(ConfigTransactionResult {
+    snapshot,
+    artifacts,
+    message: "配置事务已提交，可从历史版本回滚".into(),
+  })
+}
+
+#[tauri::command]
+async fn app_list_config_profiles(state: State<'_, SharedState>) -> Result<Vec<ConfigProfile>, String> {
+  let _transaction_guard = state.config_transaction.lock().await;
+  list_profiles().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn app_save_config_profile(
+  state: State<'_, SharedState>,
+  profile_id: Option<String>,
+  expected_updated_at: Option<u64>,
+  profile: ConfigProfileInput,
+) -> Result<ConfigProfile, String> {
+  let _transaction_guard = state.config_transaction.lock().await;
+  save_profile(profile_id.as_deref(), expected_updated_at, profile).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn app_delete_config_profile(
+  state: State<'_, SharedState>,
+  profile_id: String,
+  expected_updated_at: u64,
+) -> Result<(), String> {
+  let _transaction_guard = state.config_transaction.lock().await;
+  delete_profile(&profile_id, expected_updated_at).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn app_apply_config_profile(
+  state: State<'_, SharedState>,
+  profile_id: String,
+  api_key_override: Option<String>,
+) -> Result<ConfigTransactionResult, String> {
+  let _transaction_guard = state.config_transaction.lock().await;
+  let keys = state.data.read().await.keys.items.clone();
+  let (profile, target) = resolve_profile_target(&profile_id, &keys, api_key_override).map_err(|err| err.to_string())?;
+  let mut result = write_switch_transaction(&target).await?;
+
+  let persist_warning = {
+    let mut guard = state.data.write().await;
+    guard.selected_tool = profile.tool;
+    guard.selected_key_id = profile.key_id;
+    persist_state(&guard).err().map(|error| error.to_string())
+  };
+  result.message = match persist_warning {
+    Some(warning) => format!("Profile 已应用，但保存当前选择失败：{warning}"),
+    None => format!("Profile「{}」已应用，可从配置历史回滚", profile.name),
+  };
+  Ok(result)
+}
+
+#[tauri::command]
+fn app_list_config_snapshots() -> Result<Vec<ConfigSnapshotSummary>, String> {
+  list_snapshots().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn app_restore_config_snapshot(state: State<'_, SharedState>, snapshot_id: String) -> Result<ConfigTransactionResult, String> {
+  let _transaction_guard = state.config_transaction.lock().await;
+  let allowed = all_managed_config_paths();
+  let (restored, recovery) = restore_snapshot(&snapshot_id, &allowed).map_err(|err| err.to_string())?;
+  let artifacts = restored.files.iter().map(|file| {
+    (file.path.clone(), format!("已恢复 {}", file.label))
+  }).collect();
+  Ok(ConfigTransactionResult {
+    snapshot: recovery,
+    artifacts,
+    message: format!("已恢复版本：{}", restored.label),
+  })
 }
 
 #[tauri::command]
@@ -1041,13 +1430,42 @@ async fn app_get_local_route_statuses() -> Result<Vec<LocalRouteStatus>, String>
 }
 
 #[tauri::command]
-async fn app_cleanup_local_route_takeover() -> Result<Vec<(String, String)>, String> {
-  cleanup_local_route_takeover().map_err(|err| err.to_string())
+async fn app_cleanup_local_route_takeover(state: State<'_, SharedState>) -> Result<ConfigTransactionResult, String> {
+  let _transaction_guard = state.config_transaction.lock().await;
+  run_config_file_transaction("清理本地路由前", cleanup_local_route_takeover)
 }
 
 #[tauri::command]
-async fn app_restore_local_route_backups() -> Result<Vec<(String, String)>, String> {
-  restore_local_route_backups().map_err(|err| err.to_string())
+async fn app_restore_local_route_backups(state: State<'_, SharedState>) -> Result<ConfigTransactionResult, String> {
+  let _transaction_guard = state.config_transaction.lock().await;
+  run_config_file_transaction("恢复旧版备份前", restore_local_route_backups)
+}
+
+fn run_config_file_transaction(
+  label: &str,
+  operation: impl FnOnce() -> Result<Vec<(String, String)>, AppError>,
+) -> Result<ConfigTransactionResult, String> {
+  let managed = managed_paths_for_route_cleanup();
+  let allowed = all_managed_config_paths();
+  let snapshot = create_snapshot(&managed, label).map_err(|err| err.to_string())?;
+  let artifacts = match operation() {
+    Ok(artifacts) => artifacts,
+    Err(error) => {
+      return match rollback_failed_transaction(&snapshot.id, &allowed) {
+        Ok(()) => {
+          let _ = remove_snapshot(&snapshot.id);
+          Err(format!("配置事务失败，已自动回滚：{error}"))
+        }
+        Err(rollback_error) => Err(format!("配置事务失败且自动回滚失败：{error}；回滚错误：{rollback_error}；快照 {} 已保留", snapshot.id)),
+      };
+    }
+  };
+  let _ = prune_snapshots(&[snapshot.id.as_str()]);
+  Ok(ConfigTransactionResult {
+    snapshot,
+    artifacts,
+    message: "配置事务已提交，可从历史版本回滚".into(),
+  })
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -1123,6 +1541,7 @@ pub fn run() {
       app_get_tools,
       app_check_update,
       app_install_update,
+      app_cancel_update,
       app_get_preferences,
       app_set_preferences,
       app_complete_onboarding,
@@ -1153,6 +1572,12 @@ pub fn run() {
       app_logout,
       app_prepare_switch,
       app_write_switch,
+      app_list_config_profiles,
+      app_save_config_profile,
+      app_delete_config_profile,
+      app_apply_config_profile,
+      app_list_config_snapshots,
+      app_restore_config_snapshot,
       app_copy_target_preview,
       app_fetch_models,
       app_probe_best_endpoint,

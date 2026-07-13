@@ -269,6 +269,54 @@ pub struct SwitchTarget {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct ConfigProfileInput {
+  pub name: String,
+  pub tool: String,
+  pub base_url: String,
+  pub key_id: Option<u64>,
+  #[serde(default)]
+  pub api_key: Option<String>,
+  pub model: Option<String>,
+  #[serde(default)]
+  pub local_routing_enabled: bool,
+  #[serde(default)]
+  pub local_route_apps: Vec<String>,
+  #[serde(default)]
+  pub local_route_model_map: HashMap<String, String>,
+  #[serde(default)]
+  pub local_route_preserve_claude_auth: bool,
+  #[serde(default)]
+  pub local_route_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigProfile {
+  pub id: String,
+  pub created_at: u64,
+  pub updated_at: u64,
+  pub name: String,
+  pub tool: String,
+  pub base_url: String,
+  pub key_id: Option<u64>,
+  pub key_hint: Option<String>,
+  #[serde(default)]
+  pub has_stored_key: bool,
+  pub model: Option<String>,
+  #[serde(default)]
+  pub local_routing_enabled: bool,
+  #[serde(default)]
+  pub local_route_apps: Vec<String>,
+  #[serde(default)]
+  pub local_route_model_map: HashMap<String, String>,
+  #[serde(default)]
+  pub local_route_preserve_claude_auth: bool,
+  #[serde(default)]
+  pub local_route_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalRouteEntry {
   pub app: String,
   pub enabled: bool,
@@ -376,5 +424,41 @@ pub struct UpdateInstallResult {
   pub success: bool,
   pub installer_path: Option<String>,
   pub launched: bool,
+  pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDownloadProgress {
+  pub task_id: String,
+  pub status: String,
+  pub downloaded_bytes: u64,
+  pub total_bytes: u64,
+  pub percent: f64,
+  pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSnapshotFile {
+  pub path: String,
+  pub label: String,
+  pub existed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSnapshotSummary {
+  pub id: String,
+  pub created_at: u64,
+  pub label: String,
+  pub files: Vec<ConfigSnapshotFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigTransactionResult {
+  pub snapshot: ConfigSnapshotSummary,
+  pub artifacts: Vec<(String, String)>,
   pub message: String,
 }
