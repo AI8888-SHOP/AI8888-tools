@@ -221,6 +221,7 @@ jobs:
           fi
 
       - name: Create draft GitHub Release
+        id: draft_release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release_meta.outputs.tag }}
@@ -235,9 +236,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.id }}
         shell: bash
         run: |
-          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if [ -z "$RELEASE_ID" ]; then
+            echo "Draft release ID is empty" >&2
+            exit 1
+          fi
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
           if [ "$(jq -r '.draft' <<<"$release_json")" != "true" ]; then
             echo "Release must remain draft until asset verification succeeds" >&2
             exit 1
@@ -253,4 +259,8 @@ jobs:
             echo "One or more uploaded assets are missing a GitHub SHA-256 digest" >&2
             exit 1
           fi
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+          published="$(gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false -f make_latest=true)"
+          if [ "$(jq -r '.draft' <<<"$published")" != "false" ]; then
+            echo "Release ${RELEASE_TAG} was not published" >&2
+            exit 1
+          fi
