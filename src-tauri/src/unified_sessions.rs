@@ -557,7 +557,7 @@ fn resume_command(source: SessionSource, session_id: &str) -> Option<String> {
   match source {
     SessionSource::Codex => Some(format!("codex resume {session_id}")),
     SessionSource::Claude => Some(format!("claude --resume {session_id}")),
-    SessionSource::OpenCode => Some(format!("opencode --session {session_id}")),
+    SessionSource::OpenCode => Some(format!("opencode -s {session_id}")),
     SessionSource::OpenClaw => Some(format!("openclaw tui --session {session_id}")),
     SessionSource::Hermes => Some(format!("hermes --resume {session_id}")),
     SessionSource::Gemini => Some(format!("gemini --resume {session_id}")),

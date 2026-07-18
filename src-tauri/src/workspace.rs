@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use toml_edit::{value, Array, DocumentMut, Item, Table};
@@ -16,6 +17,10 @@ use crate::error::AppError;
 const WORKSPACE_SCHEMA_VERSION: u32 = 1;
 const SUPPORTED_APPS: [&str; 6] = ["codex", "claude", "gemini", "opencode", "openclaw", "hermes"];
 const MAX_ITEMS: usize = 200;
+const MAX_SKILL_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SKILL_ARCHIVE_ENTRIES: usize = 4_096;
+const MAX_SKILL_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SKILL_EXTRACTED_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -239,10 +244,36 @@ pub fn load_workspace() -> Result<WorkspaceData, AppError> {
   Ok(data)
 }
 
-pub fn save_workspace(data: &WorkspaceData) -> Result<(), AppError> {
+pub fn validate_workspace_data(data: &WorkspaceData) -> Result<(), AppError> {
+  if data.schema_version > WORKSPACE_SCHEMA_VERSION {
+    return Err(AppError::Message(format!("workspace schema {} is newer than supported schema {WORKSPACE_SCHEMA_VERSION}", data.schema_version)));
+  }
   if data.mcp_servers.len() > MAX_ITEMS || data.prompts.len() > MAX_ITEMS || data.skills.len() > MAX_ITEMS || data.projects.len() > MAX_ITEMS {
     return Err(AppError::Message("workspace item limit exceeded".into()));
   }
+  for server in &data.mcp_servers {
+    if normalize_id(&server.id)? != server.id || normalize_apps(server.enabled_apps.clone())? != server.enabled_apps {
+      return Err(AppError::Message("workspace contains an invalid MCP identifier or application list".into()));
+    }
+  }
+  for prompt in &data.prompts {
+    if normalize_id(&prompt.id)? != prompt.id || normalize_apps(prompt.enabled_apps.clone())? != prompt.enabled_apps {
+      return Err(AppError::Message("workspace contains an invalid prompt identifier or application list".into()));
+    }
+  }
+  for skill in &data.skills {
+    if normalize_id(&skill.id)? != skill.id || normalize_apps(skill.enabled_apps.clone())? != skill.enabled_apps {
+      return Err(AppError::Message("workspace contains an invalid skill identifier or application list".into()));
+    }
+  }
+  for project in &data.projects {
+    if normalize_id(&project.id)? != project.id { return Err(AppError::Message("workspace contains an invalid project identifier".into())); }
+  }
+  Ok(())
+}
+
+pub fn save_workspace(data: &WorkspaceData) -> Result<(), AppError> {
+  validate_workspace_data(data)?;
   write_json(&workspace_path(), data)
 }
 
@@ -603,9 +634,13 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), AppError> {
   for entry in fs::read_dir(source).map_err(|error| AppError::io(source, error))? {
     let entry = entry.map_err(|error| AppError::io(source, error))?;
     let target = destination.join(entry.file_name());
-    if entry.file_type().map_err(|error| AppError::io(&entry.path(), error))?.is_dir() {
+    let file_type = entry.file_type().map_err(|error| AppError::io(&entry.path(), error))?;
+    if file_type.is_symlink() {
+      return Err(AppError::Message(format!("skill source contains a symlink: {}", entry.path().display())));
+    }
+    if file_type.is_dir() {
       copy_directory(&entry.path(), &target)?;
-    } else {
+    } else if file_type.is_file() {
       fs::copy(entry.path(), &target).map_err(|error| AppError::io(&target, error))?;
     }
   }
@@ -613,7 +648,29 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), AppError> {
 }
 
 fn extract_zip(bytes: &[u8], destination: &Path) -> Result<(), AppError> {
+  if bytes.len() > MAX_SKILL_ARCHIVE_BYTES {
+    return Err(AppError::Message("skill archive exceeds 32 MB".into()));
+  }
   let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| AppError::Message(format!("invalid skill zip: {error}")))?;
+  if archive.len() > MAX_SKILL_ARCHIVE_ENTRIES {
+    return Err(AppError::Message("skill archive contains too many entries".into()));
+  }
+  let mut extracted_bytes = 0u64;
+  let mut paths = HashSet::new();
+  for index in 0..archive.len() {
+    let entry = archive.by_index(index).map_err(|error| AppError::Message(error.to_string()))?;
+    if entry.name().contains('\\') || entry.unix_mode().map(|mode| mode & 0o170000 == 0o120000).unwrap_or(false) {
+      return Err(AppError::Message("skill zip contains an unsafe entry".into()));
+    }
+    let Some(path) = entry.enclosed_name() else { return Err(AppError::Message("skill zip contains an unsafe path".into())); };
+    let key = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    if !paths.insert(key) { return Err(AppError::Message("skill zip contains duplicate paths".into())); }
+    if !entry.is_dir() {
+      if entry.size() > MAX_SKILL_FILE_BYTES { return Err(AppError::Message("skill zip contains a file larger than 16 MB".into())); }
+      extracted_bytes = extracted_bytes.checked_add(entry.size()).ok_or_else(|| AppError::Message("skill archive size overflow".into()))?;
+      if extracted_bytes > MAX_SKILL_EXTRACTED_BYTES { return Err(AppError::Message("skill archive expands beyond 128 MB".into())); }
+    }
+  }
   for index in 0..archive.len() {
     let mut entry = archive.by_index(index).map_err(|error| AppError::Message(error.to_string()))?;
     let Some(path) = entry.enclosed_name() else { return Err(AppError::Message("skill zip contains an unsafe path".into())); };
@@ -622,11 +679,30 @@ fn extract_zip(bytes: &[u8], destination: &Path) -> Result<(), AppError> {
       fs::create_dir_all(&output).map_err(|error| AppError::io(&output, error))?;
     } else {
       if let Some(parent) = output.parent() { fs::create_dir_all(parent).map_err(|error| AppError::io(parent, error))?; }
-      let mut file = fs::File::create(&output).map_err(|error| AppError::io(&output, error))?;
-      std::io::copy(&mut entry, &mut file).map_err(|error| AppError::io(&output, error))?;
+      let expected = entry.size();
+      let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&output).map_err(|error| AppError::io(&output, error))?;
+      let copied = std::io::copy(&mut entry.take(MAX_SKILL_FILE_BYTES + 1), &mut file).map_err(|error| AppError::io(&output, error))?;
+      if copied != expected { return Err(AppError::Message("skill zip entry size does not match its metadata".into())); }
     }
   }
   Ok(())
+}
+
+async fn download_skill_archive(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
+  if response.content_length().map(|length| length > MAX_SKILL_ARCHIVE_BYTES as u64).unwrap_or(false) {
+    return Err(AppError::Message("skill archive exceeds 32 MB".into()));
+  }
+  let capacity = response.content_length().unwrap_or(0).min(MAX_SKILL_ARCHIVE_BYTES as u64) as usize;
+  let mut bytes = Vec::with_capacity(capacity);
+  let mut stream = response.bytes_stream();
+  while let Some(chunk) = stream.next().await {
+    let chunk = chunk.map_err(|error| AppError::Message(error.to_string()))?;
+    if bytes.len().saturating_add(chunk.len()) > MAX_SKILL_ARCHIVE_BYTES {
+      return Err(AppError::Message("skill archive exceeds 32 MB".into()));
+    }
+    bytes.extend_from_slice(&chunk);
+  }
+  Ok(bytes)
 }
 
 fn find_skill_root(root: &Path) -> Option<PathBuf> {
@@ -679,14 +755,14 @@ fn sync_all_skills(data: &WorkspaceData) -> Result<(), AppError> {
   Ok(())
 }
 
-fn github_archive_url(source: &str) -> Option<String> {
+fn github_archive_urls(source: &str) -> Option<Vec<String>> {
   let rest = source.strip_prefix("https://github.com/")?;
   let mut parts = rest.trim_end_matches('/').split('/');
   let owner = parts.next()?;
   let repo = parts.next()?.trim_end_matches(".git");
   let tail = parts.collect::<Vec<_>>();
-  let branch = if tail.first() == Some(&"tree") { tail.get(1).copied().unwrap_or("main") } else { "main" };
-  Some(format!("https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"))
+  let branches = if tail.first() == Some(&"tree") { vec![tail.get(1).copied().unwrap_or("main")] } else { vec!["main", "master"] };
+  Some(branches.into_iter().map(|branch| format!("https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}")).collect())
 }
 
 #[tauri::command]
@@ -704,17 +780,36 @@ pub async fn app_install_skill(id: String, name: String, source: String, descrip
   let install_result = if source_path.is_dir() {
     copy_directory(&source_path, &staging)
   } else if source_path.is_file() {
-    let bytes = fs::read(&source_path).map_err(|error| AppError::io(&source_path, error));
+    let bytes = fs::metadata(&source_path).map_err(|error| AppError::io(&source_path, error)).and_then(|metadata| {
+      if metadata.len() > MAX_SKILL_ARCHIVE_BYTES as u64 { Err(AppError::Message("skill archive exceeds 32 MB".into())) }
+      else { fs::read(&source_path).map_err(|error| AppError::io(&source_path, error)) }
+    });
     bytes.and_then(|bytes| extract_zip(&bytes, &staging))
   } else if source.starts_with("https://") {
-    let url = if source.to_ascii_lowercase().ends_with(".zip") { source.clone() } else { github_archive_url(&source).ok_or_else(|| AppError::Message("Only GitHub repositories or ZIP URLs are supported".into())).map_err(|error| error.to_string())? };
-    let bytes = reqwest::Client::new().get(url).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.bytes().await.map_err(|error| error.to_string())?;
+    let urls = if source.to_ascii_lowercase().ends_with(".zip") { vec![source.clone()] } else { github_archive_urls(&source).ok_or_else(|| "Only GitHub repositories or ZIP URLs are supported".to_string())? };
+    let client = reqwest::Client::new();
+    let mut downloaded = None;
+    let mut last_error = String::new();
+    for url in urls {
+      match client.get(&url).send().await {
+        Ok(response) if response.status().is_success() => match download_skill_archive(response).await {
+          Ok(bytes) => { downloaded = Some(bytes); break; }
+          Err(error) => last_error = error.to_string(),
+        },
+        Ok(response) => last_error = format!("{url} returned {}", response.status()),
+        Err(error) => last_error = error.to_string(),
+      }
+    }
+    let bytes = downloaded.ok_or_else(|| format!("Skill download failed: {last_error}"))?;
     extract_zip(&bytes, &staging)
   } else {
     Err(AppError::Message("Skill source path does not exist".into()))
   };
   if let Err(error) = install_result { let _ = fs::remove_dir_all(&staging); return Err(error.to_string()); }
-  let skill_root = find_skill_root(&staging).ok_or_else(|| "Skill package does not contain SKILL.md".to_string())?;
+  let skill_root = match find_skill_root(&staging) {
+    Some(path) => path,
+    None => { let _ = fs::remove_dir_all(&staging); return Err("Skill package does not contain SKILL.md".into()); }
+  };
   let destination = root.join(&id);
   if destination.exists() { fs::remove_dir_all(&destination).map_err(|error| error.to_string())?; }
   if skill_root == staging {

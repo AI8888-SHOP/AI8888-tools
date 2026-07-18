@@ -148,7 +148,8 @@ jobs:
           if [ -d "${{ matrix.bundle_path }}" ]; then
             while IFS= read -r file; do
               name="$(basename "$file")"
-              destination="staged/${{ matrix.artifact }}-${name}"
+              safe_name="${name// /-}"
+              destination="staged/${{ matrix.artifact }}-${safe_name}"
               echo "$file -> $destination"
               cp "$file" "$destination"
             done < <(find "${{ matrix.bundle_path }}" -type f \( \
@@ -308,6 +309,7 @@ jobs:
           name: AI8888 Switch ${{ steps.release_meta.outputs.tag }}
           generate_release_notes: true
           draft: true
+          prerelease: false
           make_latest: false
           fail_on_unmatched_files: true
           files: release-assets/*
@@ -326,6 +328,10 @@ jobs:
           release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
           if [ "$(jq -r '.draft' <<<"$release_json")" != "true" ]; then
             echo "Release must remain draft until asset verification succeeds" >&2
+            exit 1
+          fi
+          if [ "$(jq -r '.prerelease' <<<"$release_json")" != "false" ]; then
+            echo "Release must not be marked as a prerelease" >&2
             exit 1
           fi
           assets="$(jq '.assets' <<<"$release_json")"
@@ -348,5 +354,9 @@ jobs:
           published="$(gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false -f make_latest=true)"
           if [ "$(jq -r '.draft' <<<"$published")" != "false" ]; then
             echo "Release ${RELEASE_TAG} was not published" >&2
+            exit 1
+          fi
+          if [ "$(jq -r '.prerelease' <<<"$published")" != "false" ]; then
+            echo "Release ${RELEASE_TAG} was unexpectedly marked as a prerelease" >&2
             exit 1
           fi
