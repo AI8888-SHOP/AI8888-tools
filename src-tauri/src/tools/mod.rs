@@ -82,6 +82,7 @@ pub fn default_switch_target(tool: ToolKind, base_url: &str, api_key: &str) -> S
       _ => "gpt-5.5",
     }
     .into()),
+    review_model: Some("gpt-5.5".into()),
     token_type: Some(match tool {
       ToolKind::Claude => "ANTHROPIC_AUTH_TOKEN",
       _ => "OPENAI_API_KEY",
@@ -133,7 +134,7 @@ fn ensure_toml_table<'a>(value: &'a mut toml::Value, key: &str) -> &'a mut toml:
   value.get_mut(key).and_then(|item| item.as_table_mut()).expect("nested toml table")
 }
 
-fn build_codex_config_merged(existing: &str, model: &str, base_url: &str, api_key: &str, route_only: bool) -> String {
+fn build_codex_config_merged(existing: &str, model: &str, review_model: &str, base_url: &str, api_key: &str, route_only: bool) -> String {
   let mut root = existing
     .parse::<toml::Value>()
     .ok()
@@ -143,7 +144,7 @@ fn build_codex_config_merged(existing: &str, model: &str, base_url: &str, api_ke
   root_table.insert("model_provider".into(), toml::Value::String("ai8888".into()));
   if !route_only {
     root_table.insert("model".into(), toml::Value::String(model.into()));
-    root_table.insert("review_model".into(), toml::Value::String(model.into()));
+    root_table.insert("review_model".into(), toml::Value::String(review_model.into()));
     root_table.insert("model_reasoning_effort".into(), toml::Value::String("high".into()));
     root_table.insert("disable_response_storage".into(), toml::Value::Boolean(true));
     root_table.insert("network_access".into(), toml::Value::String("enabled".into()));
@@ -176,8 +177,9 @@ fn build_codex_config_merged(existing: &str, model: &str, base_url: &str, api_ke
 fn write_codex(target: &SwitchTarget) -> Result<(), AppError> {
   let config_path = path_for("codex", "config.toml");
   let model = target.model.clone().unwrap_or_else(|| "gpt-5.5".into());
+  let review_model = target.review_model.clone().unwrap_or_else(|| model.clone());
   let existing = fs::read_to_string(&config_path).unwrap_or_default();
-  let config = build_codex_config_merged(&existing, &model, &effective_base_url(target), effective_api_key(target), target.local_route_only);
+  let config = build_codex_config_merged(&existing, &model, &review_model, &effective_base_url(target), effective_api_key(target), target.local_route_only);
   write_text(&config_path, &config)
 }
 
@@ -1005,6 +1007,7 @@ mod tests {
       base_url: "https://sub.ai8888.shop/v1".to_string(),
       api_key: "sk-test".to_string(),
       model: Some("gpt-test".to_string()),
+      review_model: Some("gpt-review".to_string()),
       token_type: None,
       local_routing_enabled: false,
       local_route_apps: Vec::new(),
@@ -1026,6 +1029,7 @@ mod tests {
       let auth = fs::read_to_string(&auth_path).expect("read codex auth");
       assert_eq!(auth, "{\"OPENAI_API_KEY\":\"keep-auth\",\"tokens\":{\"access_token\":\"oauth\"}}\n");
       assert!(config.contains("model_provider = \"ai8888\""));
+      assert!(config.contains("review_model = \"gpt-review\""));
       assert!(config.contains("[model_providers.ai8888]"));
       assert!(config.contains("base_url = \"https://sub.ai8888.shop/v1\""));
       assert!(config.contains("experimental_bearer_token = \"sk-test\""));

@@ -27,6 +27,8 @@ struct StoredConfigProfile {
   api_key: String,
   model: Option<String>,
   #[serde(default)]
+  review_model: Option<String>,
+  #[serde(default)]
   local_routing_enabled: bool,
   #[serde(default)]
   local_route_apps: Vec<String>,
@@ -130,8 +132,13 @@ fn normalize_input(mut input: ConfigProfileInput) -> Result<ConfigProfileInput, 
     input.api_key = (!api_key.is_empty()).then_some(api_key);
   }
   input.model = input.model.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+  input.review_model = input.review_model.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
   if input.model.as_ref().map(|value| value.len() > 200 || value.chars().any(char::is_control)).unwrap_or(false) {
     return Err(AppError::Message("Profile 的模型名称无效".into()));
+  }
+
+  if input.review_model.as_ref().map(|value| value.len() > 200 || value.chars().any(char::is_control)).unwrap_or(false) {
+    return Err(AppError::Message("Profile 的自动审核模型名称无效".into()));
   }
 
   let mut seen = HashSet::new();
@@ -192,6 +199,7 @@ fn summary(profile: &StoredConfigProfile) -> ConfigProfile {
     key_hint: key_hint(&profile.api_key),
     has_stored_key: !profile.api_key.is_empty(),
     model: profile.model.clone(),
+    review_model: profile.review_model.clone(),
     local_routing_enabled: profile.local_routing_enabled,
     local_route_apps: profile.local_route_apps.clone(),
     local_route_model_map: profile.local_route_model_map.clone(),
@@ -218,6 +226,7 @@ fn apply_input(profile: &mut StoredConfigProfile, input: ConfigProfileInput, upd
   profile.key_id = input.key_id;
   profile.api_key = next_api_key;
   profile.model = input.model;
+  profile.review_model = input.review_model;
   profile.local_routing_enabled = input.local_routing_enabled;
   profile.local_route_apps = input.local_route_apps;
   profile.local_route_model_map = input.local_route_model_map;
@@ -305,7 +314,8 @@ pub fn resolve_profile_target(profile_id: &str, keys: &[ApiKeySummary], api_key_
     profile_name: profile.name,
     base_url: profile.base_url,
     api_key,
-    model: profile.model,
+    model: profile.model.clone(),
+    review_model: profile.review_model.or(profile.model),
     token_type: None,
     local_routing_enabled: profile.local_routing_enabled,
     local_route_apps: profile.local_route_apps,
@@ -328,6 +338,7 @@ mod tests {
       key_id: Some(7),
       api_key: None,
       model: Some("gpt-test".into()),
+      review_model: Some("gpt-review".into()),
       local_routing_enabled: false,
       local_route_apps: Vec::new(),
       local_route_model_map: HashMap::new(),
@@ -351,6 +362,7 @@ mod tests {
     let saved = save_profile(Some(&created.id), Some(created.updated_at), updated).expect("update profile");
     assert_eq!(saved.name, "Work renamed");
     assert_eq!(saved.model.as_deref(), Some("gpt-updated"));
+    assert_eq!(saved.review_model.as_deref(), Some("gpt-review"));
     delete_profile(&created.id, saved.updated_at).expect("delete profile");
     assert!(list_profiles().expect("list profiles").is_empty());
 

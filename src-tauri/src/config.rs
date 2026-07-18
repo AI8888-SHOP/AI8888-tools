@@ -11,6 +11,7 @@ pub const API_BASE_URL: &str = "https://sub.ai8888.shop/api/v1";
 pub const OPENAI_BASE_URL: &str = "https://sub.ai8888.shop/v1";
 pub const SITE_BASE_URL: &str = "https://sub.ai8888.shop";
 pub const PURCHASE_URL: &str = "https://sub.ai8888.shop/purchase";
+pub const REST_URL: &str = "https://rest.ai8888.shop";
 pub const RADAR_URL: &str = "https://codexradar.com/assets/radar-high-readout-comic.png";
 pub const MODEL_STATUS_URL: &str = "https://status.ai8888.shop/";
 pub const LOCAL_PROXY_BASE_URL: &str = "http://127.0.0.1:15888";

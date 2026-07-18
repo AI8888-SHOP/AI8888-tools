@@ -1,4 +1,6 @@
-﻿fn main() {
+﻿#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+fn main() {
   #[cfg(target_os = "linux")]
   {
     if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {

@@ -254,6 +254,7 @@ pub struct SwitchTarget {
   pub base_url: String,
   pub api_key: String,
   pub model: Option<String>,
+  pub review_model: Option<String>,
   pub token_type: Option<String>,
   #[serde(default)]
   pub local_routing_enabled: bool,
@@ -277,6 +278,7 @@ pub struct ConfigProfileInput {
   #[serde(default)]
   pub api_key: Option<String>,
   pub model: Option<String>,
+  pub review_model: Option<String>,
   #[serde(default)]
   pub local_routing_enabled: bool,
   #[serde(default)]
@@ -303,6 +305,7 @@ pub struct ConfigProfile {
   #[serde(default)]
   pub has_stored_key: bool,
   pub model: Option<String>,
+  pub review_model: Option<String>,
   #[serde(default)]
   pub local_routing_enabled: bool,
   #[serde(default)]

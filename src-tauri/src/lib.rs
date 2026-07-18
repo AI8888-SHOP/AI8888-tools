@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use api::{ApiClient, CreateKeyPayload, LoginPayload, ModelsQuery, RefreshPayload, UpdateKeyPayload};
 use codex_sessions::{CodexSessionMessage, CodexSessionMeta, CodexSessionSearchHit, CodexSessionSearchRequest, CodexSessionVisibilityRepairOutcome, CodexSessionVisibilityRepairRequest};
-use config::{ensure_app_dir, local_route_manifest_path, preferences_path, read_json, state_path, updates_dir, write_json, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL};
+use config::{ensure_app_dir, local_route_manifest_path, preferences_path, read_json, state_path, updates_dir, write_json, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL, REST_URL};
 use config_profiles::{delete_profile, list_profiles, resolve_profile_target, save_profile};
 use config_transaction::{create_snapshot, list_snapshots, prune_snapshots, remove_snapshot, restore_snapshot, rollback_failed_transaction};
 use error::AppError;
@@ -26,7 +26,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{watch, Mutex, RwLock};
 use tools::{all_managed_config_paths, build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, managed_paths_for_route_cleanup, managed_paths_for_target, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
 
-const CURRENT_APP_VERSION: &str = "v0.0.5";
+const CURRENT_APP_VERSION: &str = "v0.0.6";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
@@ -707,7 +707,7 @@ mod update_download_tests {
 
   #[test]
   fn accelerates_github_download_url() {
-    let original = "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.5/AI8888.Switch_0.0.5_x64-setup.exe";
+    let original = "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.6/AI8888.Switch_0.0.6_x64-setup.exe";
     let accelerated = accelerate_github_download_url(original);
     assert_eq!(accelerated, format!("{GITHUB_DOWNLOAD_ACCELERATOR_PREFIX}{original}"));
     assert_eq!(accelerate_github_download_url(&accelerated), accelerated);
@@ -716,44 +716,44 @@ mod update_download_tests {
   #[test]
   fn scores_current_platform_installers_positive() {
     let samples = [
-      "ai8888-switch_0.0.5_x64-setup.exe",
-      "AI8888 Switch_0.0.5_x64_en-US.msi",
-      "AI8888.Switch_0.0.5_x64.dmg",
-      "ai8888-switch_0.0.5_amd64.AppImage",
-      "ai8888-switch_0.0.5_amd64.deb",
-      "ai8888-switch-0.0.5-1.x86_64.rpm",
+      "ai8888-switch_0.0.6_x64-setup.exe",
+      "AI8888 Switch_0.0.6_x64_en-US.msi",
+      "AI8888.Switch_0.0.6_x64.dmg",
+      "ai8888-switch_0.0.6_amd64.AppImage",
+      "ai8888-switch_0.0.6_amd64.deb",
+      "ai8888-switch-0.0.6-1.x86_64.rpm",
     ];
     assert!(samples.iter().any(|name| score_release_asset(&name.to_ascii_lowercase()) > 50));
   }
 
   #[test]
   fn rejects_installers_for_another_operating_system_or_architecture() {
-    assert!(score_release_asset_for("windows", "x86_64", "ai8888.switch_0.0.5_x64-setup.exe") > 0);
-    assert!(score_release_asset_for("macos", "aarch64", "ai8888.switch_0.0.5_universal.dmg") > 0);
-    assert!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.5_amd64.appimage") > 0);
-    assert_eq!(score_release_asset_for("windows", "x86_64", "ai8888.switch_0.0.5_universal.dmg"), 0);
-    assert_eq!(score_release_asset_for("macos", "aarch64", "ai8888.switch_0.0.5_x64-setup.exe"), 0);
-    assert_eq!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.5_universal.dmg"), 0);
-    assert_eq!(score_release_asset_for("windows", "aarch64", "ai8888.switch_0.0.5_x64-setup.exe"), 0);
-    assert_eq!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.5_aarch64.appimage"), 0);
+    assert!(score_release_asset_for("windows", "x86_64", "ai8888.switch_0.0.6_x64-setup.exe") > 0);
+    assert!(score_release_asset_for("macos", "aarch64", "ai8888.switch_0.0.6_universal.dmg") > 0);
+    assert!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.6_amd64.appimage") > 0);
+    assert_eq!(score_release_asset_for("windows", "x86_64", "ai8888.switch_0.0.6_universal.dmg"), 0);
+    assert_eq!(score_release_asset_for("macos", "aarch64", "ai8888.switch_0.0.6_x64-setup.exe"), 0);
+    assert_eq!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.6_universal.dmg"), 0);
+    assert_eq!(score_release_asset_for("windows", "aarch64", "ai8888.switch_0.0.6_x64-setup.exe"), 0);
+    assert_eq!(score_release_asset_for("linux", "x86_64", "ai8888.switch_0.0.6_aarch64.appimage"), 0);
   }
 
   #[test]
   fn validates_repository_release_size_and_digest() {
     let digest = format!("sha256:{:x}", Sha256::digest(b"installer"));
     let asset = ReleaseAsset {
-      name: "AI8888.Switch_0.0.5_x64-setup.exe".into(),
-      download_url: "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.5/AI8888.Switch_0.0.5_x64-setup.exe".into(),
+      name: "AI8888.Switch_0.0.6_x64-setup.exe".into(),
+      download_url: "https://github.com/AI8888-SHOP/AI8888-tools/releases/download/v0.0.6/AI8888.Switch_0.0.6_x64-setup.exe".into(),
       size: 4096,
       digest: Some(digest),
     };
-    assert!(validate_release_asset(&asset, "v0.0.5").is_ok());
+    assert!(validate_release_asset(&asset, "v0.0.6").is_ok());
     let mut wrong_repository = asset.clone();
     wrong_repository.download_url = wrong_repository.download_url.replace("AI8888-SHOP", "untrusted");
-    assert!(validate_release_asset(&wrong_repository, "v0.0.5").is_err());
+    assert!(validate_release_asset(&wrong_repository, "v0.0.6").is_err());
     let mut missing_digest = asset;
     missing_digest.digest = None;
-    assert!(validate_release_asset(&missing_digest, "v0.0.5").is_err());
+    assert!(validate_release_asset(&missing_digest, "v0.0.6").is_err());
   }
 
   #[test]
@@ -887,6 +887,11 @@ fn open_external_window(app: tauri::AppHandle, label: &str, title: &str, url: &s
 #[tauri::command]
 async fn app_open_purchase_window(app: tauri::AppHandle) -> Result<(), String> {
   open_external_window(app, "purchase", "AI8888 Purchase", PURCHASE_URL, 1180.0, 860.0)
+}
+
+#[tauri::command]
+async fn app_open_daily_reset_window(app: tauri::AppHandle) -> Result<(), String> {
+  open_external_window(app, "daily-reset", "AI8888 Daily Reset", REST_URL, 1180.0, 860.0)
 }
 
 #[tauri::command]
@@ -1264,7 +1269,7 @@ async fn app_logout(state: State<'_, SharedState>) -> Result<AppStateData, Strin
 }
 
 #[tauri::command]
-async fn app_prepare_switch(state: State<'_, SharedState>, tool: String, base_url: Option<String>, api_key: String, model: Option<String>, local_routing_enabled: Option<bool>, local_route_apps: Option<Vec<String>>, local_route_model_map: Option<HashMap<String, String>>, local_route_preserve_claude_auth: Option<bool>, local_route_only: Option<bool>) -> Result<SwitchTarget, String> {
+async fn app_prepare_switch(state: State<'_, SharedState>, tool: String, base_url: Option<String>, api_key: String, model: Option<String>, review_model: Option<String>, local_routing_enabled: Option<bool>, local_route_apps: Option<Vec<String>>, local_route_model_map: Option<HashMap<String, String>>, local_route_preserve_claude_auth: Option<bool>, local_route_only: Option<bool>) -> Result<SwitchTarget, String> {
   let tool = match tool.as_str() {
     "codex" => ToolKind::Codex,
     "claude" => ToolKind::Claude,
@@ -1283,6 +1288,11 @@ async fn app_prepare_switch(state: State<'_, SharedState>, tool: String, base_ur
   target.local_route_only = local_route_only.unwrap_or(false);
   if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
     target.model = Some(model);
+  }
+  if let Some(review_model) = review_model.filter(|value| !value.trim().is_empty()) {
+    target.review_model = Some(review_model);
+  } else {
+    target.review_model = target.model.clone();
   }
   Ok(target)
 }
@@ -1549,6 +1559,7 @@ pub fn run() {
       app_search_codex_sessions,
       app_open_login_window,
       app_open_purchase_window,
+      app_open_daily_reset_window,
       app_open_radar_window,
       app_open_model_status_window,
       app_open_codex_sessions_window,
