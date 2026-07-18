@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 import { buildAccountAlerts, isActiveSubscription, money, moneyOrDash, percentLabel, quotaLine, subscriptionProgressInfo, usageWindow, type GroupSummary, type SubscriptionProgress, type SubscriptionProgressInfo, type SubscriptionSummary } from "./subscription";
 import CodexOfficialAccount from "./CodexOfficialAccount";
+import WorkspaceCenter from "./WorkspaceCenter";
 
 type AccountSummary = { id: number; email: string; username?: string | null; role?: string | null; balance: number; concurrency: number; status: string; runMode?: string | null };
 type ApiKeySummary = { id: number; name: string; key?: string | null; status?: string | null; quota?: number | null; quotaUsed?: number | null; expiresAt?: string | null; groupId?: number | null; group?: GroupSummary | null };
@@ -31,6 +32,8 @@ type CodexSessionMeta = { sessionId: string; title?: string | null; summary?: st
 type CodexSessionSearchHit = { session: CodexSessionMeta; matchedIn: string[]; snippet?: string | null };
 type CodexSessionMessage = { role: string; content: string; timestamp?: string | null };
 type CodexSessionVisibilityRepairOutcome = { sessionId: string; sourcePath: string; success: boolean; changed: boolean; error?: string | null };
+type UnifiedSessionMeta = { source: string; sourceLabel: string; sessionId: string; title?: string | null; summary?: string | null; projectDir?: string | null; createdAt?: string | null; lastActiveAt?: string | null; model?: string | null; sourcePath: string; resumeCommand?: string | null; archived: boolean; modifiedAt: number; messageCount?: number | null };
+type UnifiedSessionMessage = { role: string; content: string; timestamp?: string | null; messageType?: string | null };
 
 const defaultState: AppStateData = { account: null, subscriptions: [], subscriptionProgress: [], groups: [], keys: { items: [], total: 0 }, selectedTool: "codex", selectedKeyId: null, loginWindowOpen: false };
 
@@ -105,13 +108,13 @@ function AuthGate(props: { email: string; password: string; setEmail: (v: string
         </div>
       </section>
       <CodexOfficialAccount standalone />
-      <footer className="appFooter">v0.0.7 Copyright AI8888.SHOP 2026</footer>
+      <footer className="appFooter">v0.1.0 Copyright AI8888.SHOP 2026</footer>
     </main>
   );
 }
 
 
-function sessionTitle(session: CodexSessionMeta) {
+function sessionTitle(session: UnifiedSessionMeta) {
   return session.title || session.summary || session.projectDir?.split(/[\\/]/).filter(Boolean).pop() || session.sessionId;
 }
 
@@ -124,27 +127,26 @@ function displayTime(value?: string | null) {
 function roleLabel(role: string) {
   const normalized = role.toLowerCase();
   if (normalized === "user") return "\u7528\u6237";
-  if (normalized === "assistant") return "Codex";
+  if (normalized === "assistant") return "Assistant";
   if (normalized === "tool") return "\u5de5\u5177";
   return role || "\u6d88\u606f";
 }
 
 function CodexSessionsApp() {
-  const [sessions, setSessions] = useState<CodexSessionMeta[]>([]);
-  const [messages, setMessages] = useState<CodexSessionMessage[]>([]);
-  const [selected, setSelected] = useState<CodexSessionMeta | null>(null);
+  const [sessions, setSessions] = useState<UnifiedSessionMeta[]>([]);
+  const [messages, setMessages] = useState<UnifiedSessionMessage[]>([]);
+  const [selected, setSelected] = useState<UnifiedSessionMeta | null>(null);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
   const [query, setQuery] = useState("");
   const [includeMessages, setIncludeMessages] = useState(true);
   const [scope, setScope] = useState<"all" | "active" | "archived">("all");
-  const [providerFilter, setProviderFilter] = useState("");
-  const [searchHits, setSearchHits] = useState<CodexSessionSearchHit[] | null>(null);
+  const [sourceFilter, setSourceFilter] = useState("all");
   const [searching, setSearching] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState("\u5c31\u7eea");
 
-  function applySessions(next: CodexSessionMeta[]) {
+  function applySessions(next: UnifiedSessionMeta[]) {
     setSessions(next);
     setSelected((current) => {
       if (!current) return next[0] ?? null;
@@ -156,12 +158,12 @@ function CodexSessionsApp() {
     });
   }
 
-  async function loadSessions(okMessage?: string) {
+  async function loadSessions(okMessage?: string, searchQuery?: string) {
     setBusy(true); setError(null);
     try {
-      const next = await invoke<CodexSessionMeta[]>("app_list_codex_sessions");
+      const next = await invoke<UnifiedSessionMeta[]>("app_list_unified_sessions", { source: sourceFilter, query: searchQuery || null });
       applySessions(next);
-      setMessage(okMessage ?? `\u5df2\u52a0\u8f7d ${next.length} \u4e2a Codex \u4f1a\u8bdd`);
+      setMessage(okMessage ?? `已加载 ${next.length} 个跨工具会话`);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -169,11 +171,11 @@ function CodexSessionsApp() {
     }
   }
 
-  async function loadMessages(session: CodexSessionMeta | null) {
+  async function loadMessages(session: UnifiedSessionMeta | null) {
     if (!session) { setMessages([]); return; }
     setError(null);
     try {
-      setMessages(await invoke<CodexSessionMessage[]>("app_get_codex_session_messages", { sourcePath: session.sourcePath }));
+      setMessages(await invoke<UnifiedSessionMessage[]>("app_get_unified_session_messages", { source: session.source, sourcePath: session.sourcePath }));
     } catch (err) {
       setMessages([]);
       setError(String(err));
@@ -186,52 +188,20 @@ function CodexSessionsApp() {
   }
 
   const filtered = useMemo(() => {
-    if (searchHits) return searchHits.map((hit) => hit.session);
     let list = sessions;
     if (scope === "active") list = list.filter((session) => !session.archived);
     if (scope === "archived") list = list.filter((session) => session.archived);
-    const provider = providerFilter.trim().toLowerCase();
-    if (provider) {
-      list = list.filter((session) => [session.modelProvider, session.modelProviderKey].some((value) => (value || "").toLowerCase().includes(provider)));
-    }
     const text = query.trim().toLowerCase();
     if (!text) return list;
-    return list.filter((session) => [session.sessionId, session.title, session.summary, session.projectDir, session.modelProvider, session.sourcePath].some((value) => (value || "").toLowerCase().includes(text)));
-  }, [query, sessions, searchHits, scope, providerFilter]);
-
-  const hitMap = useMemo(() => {
-    const map = new Map<string, CodexSessionSearchHit>();
-    (searchHits || []).forEach((hit) => map.set(hit.session.sourcePath, hit));
-    return map;
-  }, [searchHits]);
+    return list.filter((session) => [session.sessionId, session.title, session.summary, session.projectDir, session.model, session.sourcePath, session.sourceLabel].some((value) => (value || "").toLowerCase().includes(text)));
+  }, [query, sessions, scope]);
 
   async function runSessionSearch() {
     const text = query.trim();
-    const provider = providerFilter.trim();
-    const needsBackend = includeMessages && text.length > 0;
-    if (!needsBackend) {
-      setSearchHits(null);
-      setMessage(text || provider ? "\u5df2\u6309\u672c\u5730\u6761\u4ef6\u8fc7\u6ee4" : "\u5c55\u793a\u5168\u90e8\u4f1a\u8bdd");
-      return;
-    }
     setSearching(true); setError(null);
     try {
-      const hits = await invoke<CodexSessionSearchHit[]>("app_search_codex_sessions", {
-        request: {
-          query: text,
-          includeMessages,
-          archivedOnly: scope === "archived",
-          activeOnly: scope === "active",
-          provider: provider || null,
-          limit: 200,
-        },
-      });
-      setSearchHits(hits);
-      setMessage(`\u641c\u7d22\u5230 ${hits.length} \u4e2a\u4f1a\u8bdd\uff08\u542b\u6d88\u606f\u5168\u6587\uff09`);
-      if (hits[0]) {
-        setSelected(hits[0].session);
-        await loadMessages(hits[0].session);
-      }
+      if (includeMessages && text) await loadSessions(undefined, text);
+      else await loadSessions(text ? "已按会话元数据过滤" : "展示全部会话");
     } catch (err) {
       setError(String(err));
     } finally {
@@ -243,7 +213,7 @@ function CodexSessionsApp() {
   const actionTargets = selectedBatch.length > 0 ? selectedBatch : (selected ? [selected] : []);
   const allFilteredSelected = filtered.length > 0 && filtered.every((session) => selectedPaths.has(session.sourcePath));
 
-  function toggleSelection(session: CodexSessionMeta, checked: boolean) {
+  function toggleSelection(session: UnifiedSessionMeta, checked: boolean) {
     setSelectedPaths((current) => {
       const next = new Set(current);
       if (checked) next.add(session.sourcePath); else next.delete(session.sourcePath);
@@ -260,41 +230,48 @@ function CodexSessionsApp() {
     });
   }
 
-  async function launchSessions(targets: CodexSessionMeta[]) {
+  async function launchSessions(targets: UnifiedSessionMeta[]) {
     if (targets.length === 0) return;
     setBusy(true); setError(null);
     const failed: string[] = [];
+    const copied: string[] = [];
     try {
       for (const target of targets) {
-        try {
-          await invoke("app_launch_codex_session", { sessionId: target.sessionId, cwd: target.projectDir ?? null, modelProviderKey: target.modelProviderKey ?? null });
-        } catch (err) {
-          failed.push(`${target.resumeCommand}  # ${String(err)}`);
+        if (target.source === "codex") {
+          try {
+            await invoke("app_launch_codex_session", { sessionId: target.sessionId, cwd: target.projectDir ?? null, modelProviderKey: null });
+          } catch (err) {
+            failed.push(`${target.resumeCommand || target.sessionId}  # ${String(err)}`);
+          }
+        } else if (target.resumeCommand) {
+          copied.push(target.resumeCommand);
         }
       }
+      if (copied.length > 0) await navigator.clipboard.writeText(copied.join("\n"));
       if (failed.length > 0) {
         await navigator.clipboard.writeText(failed.join("\n"));
         setError(`\u6709 ${failed.length} \u4e2a\u4f1a\u8bdd\u542f\u52a8\u5931\u8d25\uff0c\u5df2\u590d\u5236\u5931\u8d25\u9879\u7684\u6062\u590d\u547d\u4ee4\u3002`);
       }
-      const successCount = targets.length - failed.length;
-      setMessage(`\u5df2\u6253\u5f00 ${successCount} \u4e2a Codex \u6062\u590d\u7a97\u53e3`);
+      const successCount = targets.filter((item) => item.source === "codex").length - failed.length;
+      setMessage(`已打开 ${successCount} 个 Codex 恢复窗口${copied.length ? `，并复制 ${copied.length} 条其他工具恢复命令` : ""}`);
     } finally {
       setBusy(false);
     }
   }
 
-  async function repairVisibility(targets: CodexSessionMeta[]) {
-    if (targets.length === 0) return;
+  async function repairVisibility(targets: UnifiedSessionMeta[]) {
+    const codexTargets = targets.filter((item) => item.source === "codex");
+    if (codexTargets.length === 0) { setMessage("可见性修复仅适用于 Codex 会话"); return; }
     setBusy(true); setError(null);
     try {
-      const results = await invoke<CodexSessionVisibilityRepairOutcome[]>("app_repair_codex_session_visibility", { requests: targets.map((session) => ({ sessionId: session.sessionId, sourcePath: session.sourcePath })) });
+      const results = await invoke<CodexSessionVisibilityRepairOutcome[]>("app_repair_codex_session_visibility", { requests: codexTargets.map((session) => ({ sessionId: session.sessionId, sourcePath: session.sourcePath })) });
       const failed = results.filter((item) => !item.success);
       const changed = results.filter((item) => item.success && item.changed).length;
       const unchanged = results.filter((item) => item.success && !item.changed).length;
       if (failed.length > 0) {
         setError(`\u6709 ${failed.length} \u4e2a\u4f1a\u8bdd\u4fee\u590d\u5931\u8d25\uff1a${failed[0].error || "\u672a\u77e5\u9519\u8bef"}`);
       }
-      const next = await invoke<CodexSessionMeta[]>("app_list_codex_sessions");
+      const next = await invoke<UnifiedSessionMeta[]>("app_list_unified_sessions", { source: sourceFilter, query: null });
       applySessions(next);
       setMessage(`\u5df2\u4fee\u590d ${changed} \u4e2a\u4f1a\u8bdd\u53ef\u89c1\u6027\uff0c${unchanged} \u4e2a\u65e0\u9700\u4fee\u590d`);
     } catch (err) {
@@ -304,28 +281,28 @@ function CodexSessionsApp() {
     }
   }
 
-  useEffect(() => { void loadSessions(); }, []);
+  useEffect(() => { void loadSessions(); }, [sourceFilter]);
   useEffect(() => { void loadMessages(selected); }, [selected?.sourcePath]);
 
   return (
     <main className="shell sessionsShell">
       <section className="hero sessionsHero">
-        <div><p className="eyebrow">Codex</p><h1>{"Codex \u4f1a\u8bdd\u7ba1\u7406"}</h1><p className="heroText">{"\u6d4f\u89c8\u672c\u5730 Codex \u4f1a\u8bdd\u8bb0\u5f55\uff0c\u5e76\u6062\u590d\u9009\u4e2d\u7684\u5bf9\u8bdd\u3002"}</p></div>
+        <div><p className="eyebrow">Sessions</p><h1>跨工具会话管理</h1><p className="heroText">浏览、搜索和恢复 Codex、Claude、Gemini、OpenCode、OpenClaw 与 Hermes 本地会话。</p></div>
         <div className="statusCard"><span className="dot ok" /><div><strong>{sessions.length}{" \u4e2a\u4f1a\u8bdd"}</strong><small>{message}</small></div></div>
       </section>
       {error && <div className="alert">{error}</div>}
       <section className="sessionsGrid">
         <aside className="panel sessionsListPanel">
-          <div className="panelHead"><h2>{"\u4f1a\u8bdd\u5217\u8868"}</h2><button className="ghost mini" onClick={() => { setSearchHits(null); void loadSessions(); }} disabled={busy || searching}>{"\u5237\u65b0"}</button></div>
+          <div className="panelHead"><h2>{"\u4f1a\u8bdd\u5217\u8868"}</h2><button className="ghost mini" onClick={() => { void loadSessions(); }} disabled={busy || searching}>{"\u5237\u65b0"}</button></div>
           <div className="sessionSearchBox">
-            <input value={query} onChange={(e) => { setQuery(e.target.value); if (!e.target.value.trim()) setSearchHits(null); }} onKeyDown={(e) => { if (e.key === "Enter") void runSessionSearch(); }} placeholder={"\u641c\u7d22\u4f1a\u8bdd ID / \u6807\u9898 / \u9879\u76ee / \u6d88\u606f\u5168\u6587"} />
+            <input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void runSessionSearch(); }} placeholder={"\u641c\u7d22\u4f1a\u8bdd ID / \u6807\u9898 / \u9879\u76ee / \u6d88\u606f\u5168\u6587"} />
             <div className="sessionFilters">
-              <select value={scope} onChange={(e) => { setScope(e.target.value as "all" | "active" | "archived"); setSearchHits(null); }}>
+              <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}><option value="all">全部工具</option><option value="codex">Codex</option><option value="claude">Claude</option><option value="gemini">Gemini</option><option value="opencode">OpenCode</option><option value="openclaw">OpenClaw</option><option value="hermes">Hermes</option></select>
+              <select value={scope} onChange={(e) => { setScope(e.target.value as "all" | "active" | "archived"); }}>
                 <option value="all">{"\u5168\u90e8"}</option>
                 <option value="active">{"\u8fdb\u884c\u4e2d"}</option>
                 <option value="archived">{"\u5df2\u5f52\u6863"}</option>
               </select>
-              <input value={providerFilter} onChange={(e) => { setProviderFilter(e.target.value); setSearchHits(null); }} placeholder="provider" />
               <label className="checkboxLine compact"><input type="checkbox" checked={includeMessages} onChange={(e) => setIncludeMessages(e.target.checked)} />{"\u6d88\u606f\u5168\u6587"}</label>
               <button className="secondary mini" onClick={() => void runSessionSearch()} disabled={busy || searching}>{searching ? "\u641c\u7d22\u4e2d" : "\u641c\u7d22"}</button>
             </div>
@@ -337,27 +314,24 @@ function CodexSessionsApp() {
             <button className="ghost mini" onClick={() => repairVisibility(actionTargets)} disabled={busy || actionTargets.length === 0}>{"\u4fee\u590d\u53ef\u89c1\u6027"}</button>
           </div>
           <div className="list sessionsList">
-            {filtered.length === 0 && <p className="muted">{"\u672a\u627e\u5230 Codex \u4f1a\u8bdd\u3002"}</p>}
+            {filtered.length === 0 && <p className="muted">未找到会话。</p>}
             {filtered.map((session) => {
               const checked = selectedPaths.has(session.sourcePath);
-              const hit = hitMap.get(session.sourcePath);
               return <article className={"sessionItem " + (selected?.sourcePath === session.sourcePath ? "selected " : "") + (checked ? "checked" : "")} key={session.sourcePath} onClick={() => setSelected(session)}>
                 <input aria-label="\u9009\u62e9\u4f1a\u8bdd" type="checkbox" checked={checked} onChange={(event) => toggleSelection(session, event.target.checked)} onClick={(event) => event.stopPropagation()} />
                 <div>
                   <strong>{sessionTitle(session)}</strong>
-                  <small>{displayTime(session.lastActiveAt ?? session.createdAt)}{session.modelProvider ? ` - ${session.modelProvider}` : ""}{session.archived ? " - \u5df2\u5f52\u6863" : ""}</small>
+                  <small>{session.sourceLabel} · {displayTime(session.lastActiveAt ?? session.createdAt)}{session.model ? ` · ${session.model}` : ""}{session.archived ? " · \u5df2\u5f52\u6863" : ""}</small>
                   <small>{session.projectDir || session.sessionId}</small>
-                  {hit?.matchedIn?.length ? <small className="matchTags">{"\u5339\u914d"}: {hit.matchedIn.join(", ")}</small> : null}
-                  {hit?.snippet ? <small className="matchSnippet">{hit.snippet}</small> : null}
                 </div>
               </article>;
             })}
           </div>
         </aside>
         <section className="panel sessionDetailPanel">
-          {!selected ? <div className="emptyState"><h2>{"\u9009\u62e9\u4e00\u4e2a\u4f1a\u8bdd"}</h2><p className="muted">{"\u9009\u4e2d Codex \u4f1a\u8bdd\u540e\uff0c\u53ef\u67e5\u770b\u6d88\u606f\u548c\u6062\u590d\u547d\u4ee4\u3002"}</p></div> : <>
-            <div className="panelHead sessionDetailHead"><div><h2>{sessionTitle(selected)}</h2><p className="muted">{selected.projectDir || "\u672a\u8bb0\u5f55\u9879\u76ee\u76ee\u5f55"}{selected.modelProvider ? ` · Provider: ${selected.modelProvider}` : ""}</p></div><div className="actions"><button onClick={() => launchSessions([selected])} disabled={busy}>{"\u6062\u590d\u4f1a\u8bdd"}</button><button className="secondary" onClick={() => copy(selected.resumeCommand, "\u5df2\u590d\u5236\u6062\u590d\u547d\u4ee4")}>{"\u590d\u5236\u547d\u4ee4"}</button></div></div>
-            <div className="resumeBox"><code>{selected.resumeCommand}</code><button className="ghost mini" onClick={() => copy(selected.sourcePath, "\u5df2\u590d\u5236\u6e90\u6587\u4ef6\u8def\u5f84")}>{"\u590d\u5236\u8def\u5f84"}</button></div>
+          {!selected ? <div className="emptyState"><h2>{"\u9009\u62e9\u4e00\u4e2a\u4f1a\u8bdd"}</h2><p className="muted">选中会话后可查看消息和恢复命令。</p></div> : <>
+            <div className="panelHead sessionDetailHead"><div><h2>{sessionTitle(selected)}</h2><p className="muted">{selected.sourceLabel} · {selected.projectDir || "\u672a\u8bb0\u5f55\u9879\u76ee\u76ee\u5f55"}{selected.model ? ` · ${selected.model}` : ""}</p></div><div className="actions"><button onClick={() => launchSessions([selected])} disabled={busy}>{selected.source === "codex" ? "恢复会话" : "复制恢复命令"}</button>{selected.resumeCommand && <button className="secondary" onClick={() => copy(selected.resumeCommand || "", "\u5df2\u590d\u5236\u6062\u590d\u547d\u4ee4")}>{"\u590d\u5236\u547d\u4ee4"}</button>}</div></div>
+            <div className="resumeBox"><code>{selected.resumeCommand || "此来源暂不提供恢复命令"}</code><button className="ghost mini" onClick={() => copy(selected.sourcePath, "\u5df2\u590d\u5236\u6e90\u6587\u4ef6\u8def\u5f84")}>{"\u590d\u5236\u8def\u5f84"}</button></div>
             <div className="messageList">
               {messages.length === 0 && <p className="muted">{"\u6b64\u4f1a\u8bdd\u6ca1\u6709\u53ef\u663e\u793a\u7684\u6d88\u606f\u3002"}</p>}
               {messages.map((item, index) => <article className={`sessionMessage role-${item.role.toLowerCase()}`} key={`${item.timestamp || "m"}-${index}`}><header><strong>{roleLabel(item.role)}</strong><small>{displayTime(item.timestamp)}</small></header><pre>{item.content}</pre></article>)}
@@ -968,7 +942,7 @@ function CodexSessionsApp() {
 
       <CodexOfficialAccount canActivateAi8888={Boolean(effectiveKey)} onActivateAi8888={activateAi8888ForCodex} onConfigChanged={async () => { await refreshConfigSnapshots(); await refreshLocalRouteManifest(); }} />
 
-      <section className="panel quickActions"><div><h2>{"Codex \u4f1a\u8bdd\u7ba1\u7406"}</h2><p className="muted">{"\u6253\u5f00\u72ec\u7acb\u7a97\u53e3\u6d4f\u89c8\u672c\u5730 Codex \u4f1a\u8bdd\uff0c\u5e76\u6062\u590d\u9009\u4e2d\u7684\u5bf9\u8bdd\u3002"}</p></div><button onClick={openCodexSessions}>{"\u6253\u5f00\u4f1a\u8bdd\u7ba1\u7406"}</button></section>
+      <section className="panel quickActions"><div><h2>跨工具会话管理</h2><p className="muted">浏览、搜索并恢复 Codex、Claude、Gemini、OpenCode、OpenClaw 与 Hermes 本地会话。</p></div><button onClick={openCodexSessions}>{"\u6253\u5f00\u4f1a\u8bdd\u7ba1\u7406"}</button></section>
 
       <section className="grid two">
         <div className="panel"><div className="panelHead"><h2>订阅</h2><div className="actions"><button className="secondary mini" onClick={() => void openDailyReset()}>日卡重置</button><span className="badge">可用 {state.subscriptions.filter(isActiveSubscription).length} / 总计 {state.subscriptions.length}</span></div></div><div className="list">{state.subscriptions.length === 0 && <p className="muted">暂无订阅</p>}{state.subscriptions.map((sub) => { const progress = subscriptionProgressInfo(sub, state.subscriptionProgress); const daily = usageWindow(sub, progress, "daily"); const weekly = usageWindow(sub, progress, "weekly"); const monthly = usageWindow(sub, progress, "monthly"); return <article className="row subscriptionRow" key={sub.id}><div><strong>{progress?.groupName || sub.groupName || sub.group?.name || `订阅 #${sub.id}`}</strong><small>{sub.status} - 到期 {safeDate(progress?.expiresAt ?? sub.expiresAt)}</small><small>{quotaLine(sub, progress)}</small><div className="usageGrid"><span>日：已用 {moneyOrDash(daily.used)} / 限额 {moneyOrDash(daily.limit)} / 剩余 {moneyOrDash(daily.remaining)} / {percentLabel(daily.used, daily.limit, daily.percentage)}</span><span>周：已用 {moneyOrDash(weekly.used)} / 限额 {moneyOrDash(weekly.limit)} / 剩余 {moneyOrDash(weekly.remaining)} / {percentLabel(weekly.used, weekly.limit, weekly.percentage)}</span><span>月：已用 {moneyOrDash(monthly.used)} / 限额 {moneyOrDash(monthly.limit)} / 剩余 {moneyOrDash(monthly.remaining)} / {percentLabel(monthly.used, monthly.limit, monthly.percentage)}</span></div></div><span>{isActiveSubscription(sub) ? "有效" : "无效"}</span></article>; })}</div></div>
@@ -993,6 +967,15 @@ function CodexSessionsApp() {
           })}
         </div>
       </section>
+
+      <WorkspaceCenter
+        profiles={profiles.map((profile) => ({ id: profile.id, name: profile.name }))}
+        selectedProfileId={selectedProfileId}
+        onProfileApplied={async (profileId) => {
+          const profile = profiles.find((item) => item.id === profileId);
+          if (profile) await applyConfigProfile(profile);
+        }}
+      />
 
       <section className="panel switchPanel">
         <div className="panelHead"><h2>写入配置</h2><span className="badge">{selectedTool?.displayName ?? state.selectedTool}</span></div>
@@ -1024,7 +1007,7 @@ function CodexSessionsApp() {
       {preview.length > 0 && <section className="panel"><div className="panelHead"><h2>写入目标</h2></div><div className="list">{preview.map(([path, label]) => <article className="row" key={path}><div><strong>{label}</strong><small>{path}</small></div></article>)}</div></section>}
       {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
             <footer className="appFooter">
-        <div>v0.0.7 Copyright AI8888.SHOP 2026</div>
+        <div>v0.1.0 Copyright AI8888.SHOP 2026</div>
         <div className="footerActions">
           <button className="ghost mini" onClick={() => { void checkUpdate(); }} disabled={checkingUpdate || installingUpdate}>{checkingUpdate ? "检查中" : "检查更新"}</button>
           {updateInfo?.updateAvailable && updateInfo.downloadUrl && <button className="secondary mini" onClick={() => { void installUpdate(); }} disabled={checkingUpdate || installingUpdate}>{installingUpdate ? "正在下载安装" : "下载并安装"}</button>}

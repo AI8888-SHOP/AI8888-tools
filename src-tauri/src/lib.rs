@@ -1,4 +1,5 @@
 mod api;
+mod backup;
 mod codex_auth;
 mod codex_sessions;
 mod config;
@@ -8,30 +9,42 @@ mod error;
 mod local_proxy;
 mod models;
 mod tools;
+mod unified_sessions;
+mod usage;
+mod workspace;
 
 use std::collections::HashMap;
 
 use api::{ApiClient, CreateKeyPayload, LoginPayload, ModelsQuery, RefreshPayload, UpdateKeyPayload};
+use backup::{app_export_config, app_import_config, app_repair_workspace, app_run_diagnostics};
 use codex_auth::{open_device_auth_page, CodexAuthManager, CodexAuthStatus};
 use codex_sessions::{CodexSessionMessage, CodexSessionMeta, CodexSessionSearchHit, CodexSessionSearchRequest, CodexSessionVisibilityRepairOutcome, CodexSessionVisibilityRepairRequest};
 use config::{ensure_app_dir, local_route_manifest_path, preferences_path, read_json, state_path, updates_dir, write_json, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL, REST_URL};
 use config_profiles::{delete_profile, list_profiles, resolve_profile_target, save_profile};
 use config_transaction::{create_snapshot, list_snapshots, prune_snapshots, remove_snapshot, restore_snapshot, rollback_failed_transaction};
 use error::AppError;
-use local_proxy::ensure_local_proxy;
+use local_proxy::{app_probe_proxy_endpoints, ensure_local_proxy};
 use models::{AccountSummary, ApiKeySummary, AppPreferences, AppStateData, ConfigProfile, ConfigProfileInput, ConfigSnapshotSummary, ConfigTransactionResult, EndpointProbeSummary, GroupSummary, LocalRouteManifest, LocalRouteStatus, LoginResult, ModelSummary, Pagination, StoredSession, SubscriptionSummary, SwitchTarget, ToolProfile, UpdateCheckResult, UpdateDownloadProgress, UpdateInstallResult};
 use sha2::{Digest, Sha256};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{watch, Mutex, RwLock};
 use tools::{activate_codex_official, all_managed_config_paths, build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, managed_paths_for_route_cleanup, managed_paths_for_target, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
+use unified_sessions::{app_get_unified_session_messages, app_list_unified_sessions};
+use usage::{app_clear_usage, app_get_usage_dashboard};
+use workspace::{app_apply_project, app_delete_mcp_server, app_delete_project, app_delete_prompt, app_delete_skill, app_get_workspace, app_import_mcp_from_app, app_install_skill, app_save_mcp_server, app_save_model_price, app_save_project, app_save_prompt, app_save_proxy_settings, app_sync_mcp_servers, app_update_skill_apps};
 
-const CURRENT_APP_VERSION: &str = "v0.0.7";
+const CURRENT_APP_VERSION: &str = "v0.1.0";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
+const TRAY_STATUS_ID: &str = "tray-status";
+const TRAY_OFFICIAL_ID: &str = "tray-official";
+const TRAY_SESSIONS_ID: &str = "tray-sessions";
+const TRAY_PROFILE_PREFIX: &str = "tray-profile:";
+const TRAY_PROJECT_PREFIX: &str = "tray-project:";
 const TRAY_QUIT_ID: &str = "tray-quit";
 
 struct UpdateDownloadControl {
@@ -1385,28 +1398,44 @@ async fn app_list_config_profiles(state: State<'_, SharedState>) -> Result<Vec<C
 
 #[tauri::command]
 async fn app_save_config_profile(
+  app: tauri::AppHandle,
   state: State<'_, SharedState>,
   profile_id: Option<String>,
   expected_updated_at: Option<u64>,
   profile: ConfigProfileInput,
 ) -> Result<ConfigProfile, String> {
   let _transaction_guard = state.config_transaction.lock().await;
-  save_profile(profile_id.as_deref(), expected_updated_at, profile).map_err(|err| err.to_string())
+  let saved = save_profile(profile_id.as_deref(), expected_updated_at, profile).map_err(|err| err.to_string())?;
+  drop(_transaction_guard);
+  refresh_tray_menu(&app).map_err(|error| error.to_string())?;
+  Ok(saved)
 }
 
 #[tauri::command]
 async fn app_delete_config_profile(
+  app: tauri::AppHandle,
   state: State<'_, SharedState>,
   profile_id: String,
   expected_updated_at: u64,
 ) -> Result<(), String> {
   let _transaction_guard = state.config_transaction.lock().await;
-  delete_profile(&profile_id, expected_updated_at).map_err(|err| err.to_string())
+  delete_profile(&profile_id, expected_updated_at).map_err(|err| err.to_string())?;
+  drop(_transaction_guard);
+  refresh_tray_menu(&app).map_err(|error| error.to_string())?;
+  Ok(())
 }
 
 #[tauri::command]
 async fn app_apply_config_profile(
   state: State<'_, SharedState>,
+  profile_id: String,
+  api_key_override: Option<String>,
+) -> Result<ConfigTransactionResult, String> {
+  apply_config_profile_inner(state.inner(), profile_id, api_key_override).await
+}
+
+async fn apply_config_profile_inner(
+  state: &SharedState,
   profile_id: String,
   api_key_override: Option<String>,
 ) -> Result<ConfigTransactionResult, String> {
@@ -1525,10 +1554,93 @@ fn show_main_window(app: &tauri::AppHandle) {
   }
 }
 
+fn tray_status_text(app: &tauri::AppHandle) -> String {
+  let Some(state) = app.try_state::<SharedState>() else { return "状态载入中".into(); };
+  let official = if state.codex_auth.status().authenticated { "OpenAI 已登录" } else { "OpenAI 未登录" };
+  let balance = state.data.try_read().ok().and_then(|data| data.account.as_ref().map(|account| account.balance));
+  match balance {
+    Some(value) => format!("{official} · AI8888 ${value:.2}"),
+    None => format!("{official} · AI8888 未登录"),
+  }
+}
+
+fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+  let status_item = MenuItem::with_id(app, TRAY_STATUS_ID, tray_status_text(app), false, None::<&str>)?;
+  let mut builder = MenuBuilder::new(app)
+    .item(&status_item)
+    .separator()
+    .text(TRAY_SHOW_ID, "显示主窗口")
+    .text(TRAY_OFFICIAL_ID, "切换到 OpenAI 官方")
+    .text(TRAY_SESSIONS_ID, "打开会话管理")
+    .separator();
+  for profile in list_profiles().unwrap_or_default().into_iter().take(12) {
+    builder = builder.text(format!("{TRAY_PROFILE_PREFIX}{}", profile.id), format!("Profile · {}", profile.name));
+  }
+  let workspace = workspace::load_workspace().unwrap_or_default();
+  if !workspace.projects.is_empty() {
+    builder = builder.separator();
+    for project in workspace.projects.into_iter().take(12) {
+      let marker = if workspace.active_project_id.as_deref() == Some(&project.id) { "✓ " } else { "" };
+      builder = builder.text(format!("{TRAY_PROJECT_PREFIX}{}", project.id), format!("{marker}项目 · {}", project.name));
+    }
+  }
+  builder.separator().text(TRAY_QUIT_ID, "退出").build()
+}
+
+fn refresh_tray_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+  if let Some(tray) = app.tray_by_id(TRAY_ID) {
+    tray.set_menu(Some(build_tray_menu(app)?))?;
+  }
+  Ok(())
+}
+
+fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
+  match id {
+    TRAY_SHOW_ID => show_main_window(app),
+    TRAY_QUIT_ID => app.exit(0),
+    TRAY_SESSIONS_ID => {
+      let app = app.clone();
+      tauri::async_runtime::spawn(async move { let _ = app_open_codex_sessions_window(app).await; });
+    }
+    TRAY_OFFICIAL_ID => {
+      let app = app.clone();
+      tauri::async_runtime::spawn(async move {
+        let state = app.state::<SharedState>();
+        if state.codex_auth.status().authenticated {
+          let _guard = state.config_transaction.lock().await;
+          let _ = run_config_file_transaction("托盘切换到 OpenAI 官方前", activate_codex_official);
+        }
+        let _ = refresh_tray_menu(&app);
+      });
+    }
+    _ if id.starts_with(TRAY_PROFILE_PREFIX) => {
+      let profile_id = id.trim_start_matches(TRAY_PROFILE_PREFIX).to_string();
+      let app = app.clone();
+      tauri::async_runtime::spawn(async move {
+        let state = app.state::<SharedState>();
+        let _ = apply_config_profile_inner(state.inner(), profile_id, None).await;
+        let _ = refresh_tray_menu(&app);
+      });
+    }
+    _ if id.starts_with(TRAY_PROJECT_PREFIX) => {
+      let project_id = id.trim_start_matches(TRAY_PROJECT_PREFIX).to_string();
+      let app = app.clone();
+      tauri::async_runtime::spawn(async move {
+        if let Ok(project) = workspace::app_apply_project(project_id) {
+          if let Some(profile_id) = project.profile_id {
+            let state = app.state::<SharedState>();
+            let _ = apply_config_profile_inner(state.inner(), profile_id, None).await;
+          }
+        }
+        let _ = refresh_tray_menu(&app);
+      });
+    }
+    _ => {}
+  }
+}
+
 fn setup_system_tray(app: &tauri::App) -> tauri::Result<()> {
-  let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "显示主窗口", true, None::<&str>)?;
-  let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "退出", true, None::<&str>)?;
-  let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+  let menu = build_tray_menu(app.handle())?;
 
   let mut tray = TrayIconBuilder::with_id(TRAY_ID)
     .menu(&menu)
@@ -1539,11 +1651,7 @@ fn setup_system_tray(app: &tauri::App) -> tauri::Result<()> {
   }
 
   tray
-    .on_menu_event(|app, event| match event.id().as_ref() {
-      TRAY_SHOW_ID => show_main_window(app),
-      TRAY_QUIT_ID => app.exit(0),
-      _ => {}
-    })
+    .on_menu_event(|app, event| handle_tray_menu(app, event.id().as_ref()))
     .on_tray_icon_event(|tray, event| {
       if let TrayIconEvent::Click {
         button: MouseButton::Left,
@@ -1642,6 +1750,30 @@ pub fn run() {
       app_get_local_route_statuses,
       app_cleanup_local_route_takeover,
       app_restore_local_route_backups,
+      app_get_workspace,
+      app_save_mcp_server,
+      app_delete_mcp_server,
+      app_sync_mcp_servers,
+      app_import_mcp_from_app,
+      app_save_prompt,
+      app_delete_prompt,
+      app_install_skill,
+      app_update_skill_apps,
+      app_delete_skill,
+      app_save_project,
+      app_apply_project,
+      app_delete_project,
+      app_save_proxy_settings,
+      app_save_model_price,
+      app_export_config,
+      app_import_config,
+      app_run_diagnostics,
+      app_repair_workspace,
+      app_get_usage_dashboard,
+      app_clear_usage,
+      app_probe_proxy_endpoints,
+      app_list_unified_sessions,
+      app_get_unified_session_messages,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

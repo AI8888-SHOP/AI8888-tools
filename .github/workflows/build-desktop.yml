@@ -42,16 +42,34 @@ jobs:
         include:
           - platform: windows-latest
             artifact: windows-x64
+            arch: x64
             build_args: ""
             bundle_path: src-tauri/target/release/bundle
+            portable_path: src-tauri/target/release/ai8888-switch.exe
+          - platform: windows-11-arm
+            artifact: windows-arm64
+            arch: arm64
+            build_args: ""
+            bundle_path: src-tauri/target/release/bundle
+            portable_path: src-tauri/target/release/ai8888-switch.exe
           - platform: ubuntu-22.04
             artifact: linux-x64
+            arch: x64
             build_args: ""
             bundle_path: src-tauri/target/release/bundle
+            portable_path: ""
+          - platform: ubuntu-24.04-arm
+            artifact: linux-arm64
+            arch: arm64
+            build_args: ""
+            bundle_path: src-tauri/target/release/bundle
+            portable_path: ""
           - platform: macos-latest
             artifact: macos-universal
+            arch: universal
             build_args: --target universal-apple-darwin
             bundle_path: src-tauri/target/universal-apple-darwin/release/bundle
+            portable_path: ""
 
     runs-on: ${{ matrix.platform }}
 
@@ -83,7 +101,7 @@ jobs:
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Install Linux system dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu-')
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
@@ -128,7 +146,12 @@ jobs:
         run: |
           mkdir -p staged
           if [ -d "${{ matrix.bundle_path }}" ]; then
-            find "${{ matrix.bundle_path }}" -type f \( \
+            while IFS= read -r file; do
+              name="$(basename "$file")"
+              destination="staged/${{ matrix.artifact }}-${name}"
+              echo "$file -> $destination"
+              cp "$file" "$destination"
+            done < <(find "${{ matrix.bundle_path }}" -type f \( \
               -name '*.msi' -o \
               -name '*-setup.exe' -o \
               -name '*.exe' -o \
@@ -137,8 +160,23 @@ jobs:
               -name '*.AppImage' -o \
               -name '*.dmg' -o \
               -name '*.pkg' \
-            \) -print -exec cp '{}' staged/ \;
+            \) -print)
           fi
+
+      - name: Create Windows portable ZIP
+        if: startsWith(matrix.platform, 'windows-')
+        shell: pwsh
+        run: |
+          $binary = "${{ matrix.portable_path }}"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "Portable executable was not found: $binary"
+          }
+          $destination = "staged/AI8888-Switch-${{ steps.version.outputs.label }}-${{ matrix.arch }}-portable.zip"
+          Compress-Archive -LiteralPath $binary -DestinationPath $destination -CompressionLevel Optimal
+
+      - name: Verify staged packages
+        shell: bash
+        run: |
           count="$(find staged -type f | wc -l | tr -d ' ')"
           echo "Staged ${count} installer file(s) for ${{ matrix.artifact }}"
           ls -lh staged || true
@@ -191,21 +229,63 @@ jobs:
             -name '*.rpm' -o \
             -name '*.AppImage' -o \
             -name '*.dmg' -o \
-            -name '*.pkg' \
+            -name '*.pkg' -o \
+            -name '*-portable.zip' \
           \) -print -exec cp '{}' release-assets/ \;
           count="$(find release-assets -type f | wc -l | tr -d ' ')"
           echo "Collected ${count} installer file(s)"
           ls -lh release-assets || true
-          windows_msi="$(find release-assets -maxdepth 1 -type f -name '*.msi' | wc -l | tr -d ' ')"
-          windows_nsis="$(find release-assets -maxdepth 1 -type f -name '*-setup.exe' | wc -l | tr -d ' ')"
+          windows_x64_msi="$(find release-assets -maxdepth 1 -type f -name 'windows-x64-*.msi' | wc -l | tr -d ' ')"
+          windows_x64_nsis="$(find release-assets -maxdepth 1 -type f -name 'windows-x64-*-setup.exe' | wc -l | tr -d ' ')"
+          windows_x64_portable="$(find release-assets -maxdepth 1 -type f -name '*-x64-portable.zip' | wc -l | tr -d ' ')"
+          windows_arm64_msi="$(find release-assets -maxdepth 1 -type f -name 'windows-arm64-*.msi' | wc -l | tr -d ' ')"
+          windows_arm64_nsis="$(find release-assets -maxdepth 1 -type f -name 'windows-arm64-*-setup.exe' | wc -l | tr -d ' ')"
+          windows_arm64_portable="$(find release-assets -maxdepth 1 -type f -name '*-arm64-portable.zip' | wc -l | tr -d ' ')"
           macos_dmg="$(find release-assets -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')"
-          linux_appimage="$(find release-assets -maxdepth 1 -type f -name '*.AppImage' | wc -l | tr -d ' ')"
-          linux_deb="$(find release-assets -maxdepth 1 -type f -name '*.deb' | wc -l | tr -d ' ')"
-          linux_rpm="$(find release-assets -maxdepth 1 -type f -name '*.rpm' | wc -l | tr -d ' ')"
-          if [ "$windows_msi" -lt 1 ] || [ "$windows_nsis" -lt 1 ] || [ "$macos_dmg" -lt 1 ] || [ "$linux_appimage" -lt 1 ] || [ "$linux_deb" -lt 1 ] || [ "$linux_rpm" -lt 1 ]; then
-            echo "Missing required release assets: msi=${windows_msi}, nsis=${windows_nsis}, dmg=${macos_dmg}, appimage=${linux_appimage}, deb=${linux_deb}, rpm=${linux_rpm}" >&2
+          linux_x64_appimage="$(find release-assets -maxdepth 1 -type f -name 'linux-x64-*.AppImage' | wc -l | tr -d ' ')"
+          linux_x64_deb="$(find release-assets -maxdepth 1 -type f -name 'linux-x64-*.deb' | wc -l | tr -d ' ')"
+          linux_x64_rpm="$(find release-assets -maxdepth 1 -type f -name 'linux-x64-*.rpm' | wc -l | tr -d ' ')"
+          linux_arm64_appimage="$(find release-assets -maxdepth 1 -type f -name 'linux-arm64-*.AppImage' | wc -l | tr -d ' ')"
+          linux_arm64_deb="$(find release-assets -maxdepth 1 -type f -name 'linux-arm64-*.deb' | wc -l | tr -d ' ')"
+          linux_arm64_rpm="$(find release-assets -maxdepth 1 -type f -name 'linux-arm64-*.rpm' | wc -l | tr -d ' ')"
+          if [ "$windows_x64_msi" -lt 1 ] || [ "$windows_x64_nsis" -lt 1 ] || [ "$windows_x64_portable" -lt 1 ] || \
+             [ "$windows_arm64_msi" -lt 1 ] || [ "$windows_arm64_nsis" -lt 1 ] || [ "$windows_arm64_portable" -lt 1 ] || \
+             [ "$macos_dmg" -lt 1 ] || \
+             [ "$linux_x64_appimage" -lt 1 ] || [ "$linux_x64_deb" -lt 1 ] || [ "$linux_x64_rpm" -lt 1 ] || \
+             [ "$linux_arm64_appimage" -lt 1 ] || [ "$linux_arm64_deb" -lt 1 ] || [ "$linux_arm64_rpm" -lt 1 ]; then
+            echo "Missing required release assets for one or more OS/architecture/package combinations" >&2
             exit 1
           fi
+
+      - name: Generate Homebrew Cask
+        env:
+          RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
+        shell: bash
+        run: |
+          dmg_path="$(find release-assets -maxdepth 1 -type f -name 'macos-universal-*.dmg' -print -quit)"
+          if [ -z "$dmg_path" ]; then
+            echo "Universal macOS DMG was not found" >&2
+            exit 1
+          fi
+          dmg_name="$(basename "$dmg_path")"
+          dmg_sha256="$(sha256sum "$dmg_path" | awk '{print $1}')"
+          version="${RELEASE_TAG#v}"
+          cask_path="release-assets/ai8888-switch.rb"
+          cat > "$cask_path" <<EOF
+          cask "ai8888-switch" do
+            version "${version}"
+            sha256 "${dmg_sha256}"
+
+            url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${dmg_name}"
+            name "AI8888 Switch"
+            desc "Desktop configuration manager for AI coding tools"
+            homepage "https://ai8888.shop/"
+
+            app "AI8888 Switch.app"
+          end
+          EOF
+          test -s "$cask_path"
+          grep -F "sha256 \"${dmg_sha256}\"" "$cask_path"
 
       - name: Refuse to overwrite a published release
         env:
@@ -249,7 +329,13 @@ jobs:
             exit 1
           fi
           assets="$(jq '.assets' <<<"$release_json")"
-          for pattern in '\.msi$' '-setup\.exe$' '\.dmg$' '\.AppImage$' '\.deb$' '\.rpm$'; do
+          for pattern in \
+            '^windows-x64-.*\.msi$' '^windows-x64-.*-setup\.exe$' '-x64-portable\.zip$' \
+            '^windows-arm64-.*\.msi$' '^windows-arm64-.*-setup\.exe$' '-arm64-portable\.zip$' \
+            '^macos-universal-.*\.dmg$' \
+            '^linux-x64-.*\.AppImage$' '^linux-x64-.*\.deb$' '^linux-x64-.*\.rpm$' \
+            '^linux-arm64-.*\.AppImage$' '^linux-arm64-.*\.deb$' '^linux-arm64-.*\.rpm$' \
+            '^ai8888-switch\.rb$'; do
             if ! jq -e --arg pattern "$pattern" 'any(.[]; .name | test($pattern; "i"))' <<<"$assets" >/dev/null; then
               echo "Uploaded release is missing required asset pattern: $pattern" >&2
               exit 1

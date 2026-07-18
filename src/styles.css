@@ -19,7 +19,7 @@ body {
     linear-gradient(135deg, #09111f, #111827 48%, #111322);
 }
 
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 
 button {
   border: 0;
@@ -105,7 +105,7 @@ h2 { margin-bottom: 0; font-size: 19px; }
 .badge { border-radius: 999px; padding: 5px 10px; color: #bae6fd; background: rgba(14, 165, 233, .14); border: 1px solid rgba(14, 165, 233, .26); font-size: 12px; }
 
 label { display: grid; gap: 8px; margin-bottom: 14px; color: #cbd5e1; font-size: 13px; font-weight: 700; }
-input, select {
+input, select, textarea {
   width: 100%;
   border: 1px solid rgba(148, 163, 184, .25);
   border-radius: 12px;
@@ -114,7 +114,8 @@ input, select {
   background: rgba(15, 23, 42, .82);
   outline: none;
 }
-input:focus, select:focus { border-color: #67e8f9; box-shadow: 0 0 0 3px rgba(103, 232, 249, .1); }
+textarea { min-height: 92px; resize: vertical; line-height: 1.5; }
+input:focus, select:focus, textarea:focus { border-color: #67e8f9; box-shadow: 0 0 0 3px rgba(103, 232, 249, .1); }
 
 .inputAction { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
 .inputAction button { white-space: nowrap; }
@@ -289,6 +290,40 @@ button.mini { padding: 6px 10px; border-radius: 9px; font-size: 12px; }
 .codexLoginOutput { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(148, 163, 184, .18); }
 .codexLoginOutputHead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .codexLoginOutput pre { max-height: 180px; margin: 0; overflow: auto; padding: 12px; color: #dbeafe; background: rgba(2, 6, 23, .62); border: 1px solid rgba(148, 163, 184, .16); border-radius: 8px; white-space: pre-wrap; word-break: break-word; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+
+.workspaceCenter { margin-top: 18px; }
+.workspaceSummary { margin: 5px 0 0; font-size: 12px; }
+.segmented { display: flex; gap: 4px; padding: 4px; background: rgba(15, 23, 42, .72); border: 1px solid rgba(148, 163, 184, .18); border-radius: 8px; overflow-x: auto; }
+.segmented button { flex: 1 0 auto; min-width: 82px; border-radius: 6px; padding: 8px 10px; color: #94a3b8; background: transparent; box-shadow: none; }
+.segmented button.active { color: #f8fafc; background: #1d4ed8; }
+.workspaceTabs { margin-bottom: 18px; }
+.workspacePane { display: grid; gap: 18px; }
+.workspaceForm { display: grid; gap: 12px; align-items: end; }
+.workspaceForm label { margin-bottom: 0; }
+.formGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.formGrid .wide { grid-column: 1 / -1; }
+.compactGrid { grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto; }
+.priceForm { grid-template-columns: repeat(4, minmax(0, 1fr)) auto; padding-top: 16px; border-top: 1px solid rgba(148, 163, 184, .18); }
+.workspaceToolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.workspaceToolbar select { width: auto; min-width: 160px; }
+.workspaceList { max-height: 440px; }
+.workspaceList .row > div:first-child { min-width: 0; }
+.workspaceList .row small { overflow-wrap: anywhere; }
+.activeWorkspaceRow { border-color: rgba(52, 211, 153, .45); background: rgba(6, 78, 59, .22); }
+.appToggles { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+.appToggles label { margin: 0; }
+.promptEditor { min-height: 220px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.usageMetrics { grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0; }
+.healthDot { width: 12px; height: 12px; border-radius: 50%; background: #64748b; }
+.healthDot.healthy { background: #22c55e; box-shadow: 0 0 0 5px rgba(34, 197, 94, .12); }
+.healthDot.failed { background: #ef4444; box-shadow: 0 0 0 5px rgba(239, 68, 68, .12); }
+.diagnostic-ok { border-color: rgba(34, 197, 94, .3); }
+.diagnostic-error { border-color: rgba(239, 68, 68, .42); }
+
+@media (max-width: 980px) {
+  .formGrid, .compactGrid, .priceForm, .usageMetrics { grid-template-columns: 1fr; }
+  .formGrid .wide { grid-column: auto; }
+}
 
 @media (max-width: 980px) {
   .codexAccountGrid, .codexAccountMeta { grid-template-columns: 1fr; }

@@ -56,6 +56,26 @@ pub fn profiles_path() -> PathBuf {
   app_dir().join("profiles.json")
 }
 
+pub fn workspace_path() -> PathBuf {
+  app_dir().join("workspace.json")
+}
+
+pub fn usage_path() -> PathBuf {
+  app_dir().join("usage.jsonl")
+}
+
+pub fn managed_skills_dir() -> PathBuf {
+  app_dir().join("skills")
+}
+
+pub fn skill_backups_dir() -> PathBuf {
+  app_dir().join("skill-backups")
+}
+
+pub fn exports_dir() -> PathBuf {
+  app_dir().join("exports")
+}
+
 pub fn ensure_app_dir() -> Result<PathBuf, AppError> {
   let dir = app_dir();
   fs::create_dir_all(&dir).map_err(|err| AppError::io(&dir, err))?;
