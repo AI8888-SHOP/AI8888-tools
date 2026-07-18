@@ -91,12 +91,12 @@ fn redact_value(value: &mut Value) {
     Value::Object(map) => {
       for (key, item) in map {
         let lowered = key.to_ascii_lowercase();
-        if lowered.contains("token") || lowered.contains("api_key") || lowered.contains("apikey") || lowered == "authorization" || lowered == "password" || lowered == "secret" {
+        if lowered.contains("token") || lowered.contains("api_key") || lowered.contains("apikey") || lowered == "authorization" || lowered == "password" || lowered == "secret" || lowered == "url" || lowered == "baseurl" {
           *item = Value::String("<redacted>".into());
         } else if matches!(lowered.as_str(), "env" | "headers" | "http_headers" | "request_headers") {
           if let Some(values) = item.as_object_mut() {
             for value in values.values_mut() { *value = Value::String("<redacted>".into()); }
-          }
+          } else { *item = Value::String("<redacted>".into()); }
         } else {
           redact_value(item);
         }
@@ -109,6 +109,7 @@ fn redact_value(value: &mut Value) {
 
 fn sanitize_workspace(workspace: &mut WorkspaceData) {
   for server in &mut workspace.mcp_servers {
+    server.command = "<redacted>".into();
     server.args.clear();
     for value in server.env.values_mut() { *value = "<redacted>".into(); }
     if !server.url.is_empty() { server.url = "<redacted>".into(); }
@@ -379,12 +380,20 @@ pub fn app_import_config(path: String, passphrase: String) -> Result<WorkspaceDa
     }
   };
   if let Err(error) = sync_workspace_extensions(&bundle.workspace) {
-    let _ = restore_files(&snapshots);
-    let _ = restore_skill_tree(&skills_root, &skill_backup, had_previous);
-    if let Ok(previous) = load_workspace() { let _ = sync_workspace_extensions(&previous); }
+    let mut rollback_errors = Vec::new();
+    if let Err(rollback) = restore_files(&snapshots) { rollback_errors.push(rollback.to_string()); }
+    if let Err(rollback) = restore_skill_tree(&skills_root, &skill_backup, had_previous) { rollback_errors.push(rollback.to_string()); }
+    if rollback_errors.is_empty() {
+      if let Ok(previous) = load_workspace() {
+        if let Err(rollback) = sync_workspace_extensions(&previous) { rollback_errors.push(rollback.to_string()); }
+      }
+    }
+    if !rollback_errors.is_empty() { return Err(format!("{error}; import rollback incomplete: {}", rollback_errors.join("; "))); }
     return Err(error.to_string());
   }
-  let _ = remove_path(&skill_backup);
+  if let Err(error) = remove_path(&skill_backup) {
+    return Err(format!("configuration imported, but the previous Skills backup could not be removed: {error}"));
+  }
   Ok(bundle.workspace)
 }
 
