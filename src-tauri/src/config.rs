@@ -69,7 +69,7 @@ pub fn ensure_app_dir() -> Result<PathBuf, AppError> {
 
 pub fn path_for(tool: &str, file: &str) -> PathBuf {
   let dir = match tool {
-    "codex" => home_dir().join(".codex"),
+    "codex" => codex_home_dir(),
     "claude" => home_dir().join(".claude"),
     "gemini" => home_dir().join(".gemini"),
     "opencode" => home_dir().join(".config").join("opencode"),
@@ -83,6 +83,17 @@ pub fn path_for(tool: &str, file: &str) -> PathBuf {
   } else {
     dir.join(file)
   }
+}
+
+fn codex_home_dir() -> PathBuf {
+  #[cfg(test)]
+  if std::env::var_os("AI8888_SWITCH_TEST_HOME").is_some() {
+    return home_dir().join(".codex");
+  }
+  std::env::var_os("CODEX_HOME")
+    .filter(|value| !value.is_empty())
+    .map(PathBuf::from)
+    .unwrap_or_else(|| home_dir().join(".codex"))
 }
 
 fn backup_path(path: &Path) -> PathBuf {

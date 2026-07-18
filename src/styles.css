@@ -268,3 +268,28 @@ button.mini { padding: 6px 10px; border-radius: 9px; font-size: 12px; }
   .sessionFilters { grid-template-columns: 1fr 1fr; }
   .alertCard { flex-direction: column; }
 }
+
+
+.codexAccountPanel { margin-bottom: 18px; }
+.standaloneCodexAccount { margin-top: 18px; }
+.codexAccountHead { align-items: flex-start; }
+.codexAccountHead .muted { margin: 6px 0 0; font-size: 13px; }
+.badge.officialBadge { color: #bbf7d0; border-color: rgba(52, 211, 153, .34); background: rgba(6, 78, 59, .28); }
+.inlineAlert { margin-bottom: 14px; padding: 10px 12px; color: #fecaca; background: rgba(127, 29, 29, .34); border: 1px solid rgba(248, 113, 113, .3); border-radius: 8px; white-space: pre-wrap; }
+.codexAccountGrid { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(0, 1.7fr); gap: 18px; align-items: center; }
+.codexAccountState { min-width: 0; display: flex; align-items: center; gap: 14px; }
+.codexAccountState strong, .codexAccountState small { display: block; }
+.codexAccountState small { margin-top: 5px; color: #94a3b8; line-height: 1.45; }
+.codexAccountMeta { min-width: 0; margin: 0; display: grid; grid-template-columns: minmax(110px, .8fr) minmax(120px, .9fr) minmax(180px, 1.5fr); gap: 12px; }
+.codexAccountMeta div { min-width: 0; }
+.codexAccountMeta dt { margin-bottom: 5px; color: #94a3b8; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.codexAccountMeta dd { margin: 0; overflow: hidden; color: #dbeafe; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.codexAccountActions { margin-top: 18px; }
+.compactNote { margin: 10px 0 0; font-size: 12px; }
+.codexLoginOutput { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(148, 163, 184, .18); }
+.codexLoginOutputHead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.codexLoginOutput pre { max-height: 180px; margin: 0; overflow: auto; padding: 12px; color: #dbeafe; background: rgba(2, 6, 23, .62); border: 1px solid rgba(148, 163, 184, .16); border-radius: 8px; white-space: pre-wrap; word-break: break-word; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+
+@media (max-width: 980px) {
+  .codexAccountGrid, .codexAccountMeta { grid-template-columns: 1fr; }
+}

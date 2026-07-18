@@ -183,6 +183,47 @@ fn write_codex(target: &SwitchTarget) -> Result<(), AppError> {
   write_text(&config_path, &config)
 }
 
+pub fn activate_codex_official() -> Result<Vec<(String, String)>, AppError> {
+  let config_path = path_for("codex", "config.toml");
+  let existing = fs::read_to_string(&config_path).unwrap_or_default();
+  let mut root = if existing.trim().is_empty() {
+    toml::Value::Table(toml_table())
+  } else {
+    existing.parse::<toml::Value>().map_err(|error| AppError::Toml {
+      path: config_path.display().to_string(),
+      source: error,
+    })?
+  };
+  if !root.is_table() {
+    return Err(AppError::Message("Codex config.toml 根节点必须是 TOML 表".into()));
+  }
+  let root_table = root.as_table_mut().expect("Codex root should be a table");
+  root_table.insert("model_provider".into(), toml::Value::String("openai".into()));
+  for key in ["model", "review_model", "openai_base_url", "chatgpt_base_url"] {
+    root_table.remove(key);
+  }
+
+  let mut output = toml::to_string_pretty(&root)?;
+  if !output.ends_with('\n') {
+    output.push('\n');
+  }
+  write_text(&config_path, &output)?;
+
+  let mut artifacts = vec![(config_path.display().to_string(), "Codex 已切换到 OpenAI 官方账户".into())];
+  let manifest_path = local_route_manifest_path();
+  if manifest_path.exists() {
+    let mut manifest: LocalRouteManifest = read_json(&manifest_path)?;
+    let previous_len = manifest.entries.len();
+    manifest.entries.retain(|entry| entry.app != "codex");
+    if manifest.entries.len() != previous_len {
+      manifest.updated_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0);
+      write_json(&manifest_path, &manifest)?;
+      artifacts.push((manifest_path.display().to_string(), "Codex 本地路由已停用".into()));
+    }
+  }
+  Ok(artifacts)
+}
+
 fn write_claude(target: &SwitchTarget) -> Result<(), AppError> {
   let path = path_for("claude", "settings.json");
   let mut value = read_json_value(&path);
@@ -1034,6 +1075,49 @@ mod tests {
       assert!(config.contains("base_url = \"https://sub.ai8888.shop/v1\""));
       assert!(config.contains("experimental_bearer_token = \"sk-test\""));
       assert!(config.contains("wire_api = \"responses\""));
+    });
+  }
+
+
+  #[test]
+  fn codex_official_switch_preserves_auth_and_other_routes() {
+    with_test_home("codex-official", || {
+      let config_path = path_for("codex", "config.toml");
+      let auth_path = path_for("codex", "auth.json");
+      write_text(
+        &config_path,
+        "model_provider = \"ai8888\"\nmodel = \"gpt-ai\"\nreview_model = \"gpt-review\"\nopenai_base_url = \"https://proxy.example/v1\"\n[model_providers.ai8888]\nbase_url = \"https://sub.ai8888.shop/v1\"\nexperimental_bearer_token = \"sk-secret\"\n",
+      )
+      .expect("seed codex config");
+      write_text(&auth_path, "{\"tokens\":{\"access_token\":\"oauth\"}}\n").expect("seed codex auth");
+      write_json(
+        &local_route_manifest_path(),
+        &LocalRouteManifest {
+          profile_name: LOCAL_PROXY_PROFILE_NAME.into(),
+          updated_at: 1,
+          entries: vec![
+            LocalRouteEntry { app: "codex".into(), ..Default::default() },
+            LocalRouteEntry { app: "claude".into(), ..Default::default() },
+          ],
+        },
+      )
+      .expect("seed route manifest");
+
+      activate_codex_official().expect("activate official");
+      let config = fs::read_to_string(&config_path).expect("read codex config");
+      let value = config.parse::<toml::Value>().expect("parse codex config");
+      assert_eq!(value.get("model_provider").and_then(toml::Value::as_str), Some("openai"));
+      assert!(value.get("model").is_none());
+      assert!(value.get("review_model").is_none());
+      assert!(value.get("openai_base_url").is_none());
+      assert_eq!(
+        value.get("model_providers").and_then(|item| item.get("ai8888")).and_then(|item| item.get("experimental_bearer_token")).and_then(toml::Value::as_str),
+        Some("sk-secret"),
+      );
+      assert_eq!(fs::read_to_string(&auth_path).expect("read codex auth"), "{\"tokens\":{\"access_token\":\"oauth\"}}\n");
+      let manifest: LocalRouteManifest = read_json(&local_route_manifest_path()).expect("read route manifest");
+      assert_eq!(manifest.entries.len(), 1);
+      assert_eq!(manifest.entries[0].app, "claude");
     });
   }
 

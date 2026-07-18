@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 import { buildAccountAlerts, isActiveSubscription, money, moneyOrDash, percentLabel, quotaLine, subscriptionProgressInfo, usageWindow, type GroupSummary, type SubscriptionProgress, type SubscriptionProgressInfo, type SubscriptionSummary } from "./subscription";
+import CodexOfficialAccount from "./CodexOfficialAccount";
 
 type AccountSummary = { id: number; email: string; username?: string | null; role?: string | null; balance: number; concurrency: number; status: string; runMode?: string | null };
 type ApiKeySummary = { id: number; name: string; key?: string | null; status?: string | null; quota?: number | null; quotaUsed?: number | null; expiresAt?: string | null; groupId?: number | null; group?: GroupSummary | null };
@@ -83,12 +84,12 @@ function AuthGate(props: { email: string; password: string; setEmail: (v: string
       <section className="hero authHero">
         <div>
           <p className="eyebrow">AI8888 Switch</p>
-          <h1>请先登录 AI8888 账户</h1>
-          <p className="heroText">登录后进入配置界面，并同步显示订阅、分组、API Key 和账户余额。</p>
+          <h1>选择账户并开始使用</h1>
+          <p className="heroText">登录 AI8888 管理订阅与 Key，或直接连接 OpenAI 官方 Codex 账户。</p>
         </div>
         <div className="statusCard authCard">
           <div>
-            <strong>未登录</strong>
+            <strong>AI8888 未登录</strong>
             <small>{props.message}</small>
             <div className="statusActions"><button className="ghost mini statusButton" onClick={props.onOpenPurchase}>充值续费</button><button className="ghost mini statusButton" onClick={props.onOpenRadar}>智商雷达</button><button className="ghost mini statusButton" onClick={props.onOpenModelStatus}>模型监控</button></div>
           </div>
@@ -103,7 +104,8 @@ function AuthGate(props: { email: string; password: string; setEmail: (v: string
           <button onClick={props.onLogin} disabled={props.busy || !props.email || !props.password}>登录</button>
         </div>
       </section>
-      <footer className="appFooter">v0.0.6 Copyright AI8888.SHOP 2026</footer>
+      <CodexOfficialAccount standalone />
+      <footer className="appFooter">v0.0.7 Copyright AI8888.SHOP 2026</footer>
     </main>
   );
 }
@@ -524,6 +526,28 @@ function CodexSessionsApp() {
 
   async function openCodexSessions() { await run(() => invoke("app_open_codex_sessions_window"), "\u5df2\u6253\u5f00 Codex \u4f1a\u8bdd\u7ba1\u7406"); }
 
+
+  async function activateAi8888ForCodex() {
+    if (!effectiveKey) throw new Error("请先选择或填写一个可用的 AI8888 Key");
+    const target = await invoke<SwitchTarget>("app_prepare_switch", {
+      tool: "codex",
+      baseUrl,
+      apiKey: effectiveKey,
+      model: modelChoice || null,
+      reviewModel: reviewModelChoice || null,
+      localRoutingEnabled: false,
+      localRouteApps: [],
+      localRouteModelMap: {},
+      localRoutePreserveClaudeAuth: false,
+      localRouteOnly: false,
+    });
+    const result = await invoke<ConfigTransactionResult>("app_write_switch", { target });
+    setPreview(result.artifacts);
+    setMessage("Codex 已切换到 AI8888");
+    await refreshConfigSnapshots();
+    await refreshLocalRouteManifest();
+  }
+
     const checkUpdate = useCallback(async (options?: { silent?: boolean }) => {
     const silent = Boolean(options?.silent);
     setCheckingUpdate(true);
@@ -942,6 +966,8 @@ function CodexSessionsApp() {
         </section>
       )}
 
+      <CodexOfficialAccount canActivateAi8888={Boolean(effectiveKey)} onActivateAi8888={activateAi8888ForCodex} onConfigChanged={async () => { await refreshConfigSnapshots(); await refreshLocalRouteManifest(); }} />
+
       <section className="panel quickActions"><div><h2>{"Codex \u4f1a\u8bdd\u7ba1\u7406"}</h2><p className="muted">{"\u6253\u5f00\u72ec\u7acb\u7a97\u53e3\u6d4f\u89c8\u672c\u5730 Codex \u4f1a\u8bdd\uff0c\u5e76\u6062\u590d\u9009\u4e2d\u7684\u5bf9\u8bdd\u3002"}</p></div><button onClick={openCodexSessions}>{"\u6253\u5f00\u4f1a\u8bdd\u7ba1\u7406"}</button></section>
 
       <section className="grid two">
@@ -998,7 +1024,7 @@ function CodexSessionsApp() {
       {preview.length > 0 && <section className="panel"><div className="panelHead"><h2>写入目标</h2></div><div className="list">{preview.map(([path, label]) => <article className="row" key={path}><div><strong>{label}</strong><small>{path}</small></div></article>)}</div></section>}
       {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
             <footer className="appFooter">
-        <div>v0.0.6 Copyright AI8888.SHOP 2026</div>
+        <div>v0.0.7 Copyright AI8888.SHOP 2026</div>
         <div className="footerActions">
           <button className="ghost mini" onClick={() => { void checkUpdate(); }} disabled={checkingUpdate || installingUpdate}>{checkingUpdate ? "检查中" : "检查更新"}</button>
           {updateInfo?.updateAvailable && updateInfo.downloadUrl && <button className="secondary mini" onClick={() => { void installUpdate(); }} disabled={checkingUpdate || installingUpdate}>{installingUpdate ? "正在下载安装" : "下载并安装"}</button>}

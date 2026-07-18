@@ -1,4 +1,5 @@
 mod api;
+mod codex_auth;
 mod codex_sessions;
 mod config;
 mod config_profiles;
@@ -11,6 +12,7 @@ mod tools;
 use std::collections::HashMap;
 
 use api::{ApiClient, CreateKeyPayload, LoginPayload, ModelsQuery, RefreshPayload, UpdateKeyPayload};
+use codex_auth::{open_device_auth_page, CodexAuthManager, CodexAuthStatus};
 use codex_sessions::{CodexSessionMessage, CodexSessionMeta, CodexSessionSearchHit, CodexSessionSearchRequest, CodexSessionVisibilityRepairOutcome, CodexSessionVisibilityRepairRequest};
 use config::{ensure_app_dir, local_route_manifest_path, preferences_path, read_json, state_path, updates_dir, write_json, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL, REST_URL};
 use config_profiles::{delete_profile, list_profiles, resolve_profile_target, save_profile};
@@ -24,9 +26,9 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Emitter, Manager, State};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{watch, Mutex, RwLock};
-use tools::{all_managed_config_paths, build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, managed_paths_for_route_cleanup, managed_paths_for_target, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
+use tools::{activate_codex_official, all_managed_config_paths, build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, managed_paths_for_route_cleanup, managed_paths_for_target, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
 
-const CURRENT_APP_VERSION: &str = "v0.0.6";
+const CURRENT_APP_VERSION: &str = "v0.0.7";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
@@ -40,6 +42,7 @@ struct UpdateDownloadControl {
 pub struct SharedState {
   pub api: ApiClient,
   pub data: RwLock<AppStateData>,
+  codex_auth: CodexAuthManager,
   update_download: std::sync::Mutex<Option<UpdateDownloadControl>>,
   config_transaction: Mutex<()>,
 }
@@ -52,6 +55,7 @@ impl SharedState {
         selected_tool: ToolKind::Codex.as_str().to_string(),
         ..Default::default()
       }),
+      codex_auth: CodexAuthManager::new(),
       update_download: std::sync::Mutex::new(None),
       config_transaction: Mutex::new(()),
     })
@@ -75,6 +79,41 @@ async fn app_get_state(state: State<'_, SharedState>) -> Result<AppStateData, St
 #[tauri::command]
 async fn app_get_tools() -> Result<Vec<ToolProfile>, String> {
   Ok(supported_tools())
+}
+
+
+#[tauri::command]
+fn app_get_codex_auth_status(state: State<'_, SharedState>) -> CodexAuthStatus {
+  state.codex_auth.status()
+}
+
+#[tauri::command]
+fn app_start_codex_login(state: State<'_, SharedState>, mode: String) -> Result<CodexAuthStatus, String> {
+  state.codex_auth.start_login(&mode)
+}
+
+#[tauri::command]
+fn app_cancel_codex_login(state: State<'_, SharedState>) -> Result<CodexAuthStatus, String> {
+  state.codex_auth.cancel_login()
+}
+
+#[tauri::command]
+fn app_logout_codex(state: State<'_, SharedState>) -> Result<CodexAuthStatus, String> {
+  state.codex_auth.logout()
+}
+
+#[tauri::command]
+fn app_open_codex_device_auth_page() -> Result<(), String> {
+  open_device_auth_page()
+}
+
+#[tauri::command]
+async fn app_activate_codex_official(state: State<'_, SharedState>) -> Result<ConfigTransactionResult, String> {
+  if !state.codex_auth.status().authenticated {
+    return Err("请先登录 OpenAI/ChatGPT 官方账户".into());
+  }
+  let _transaction_guard = state.config_transaction.lock().await;
+  run_config_file_transaction("切换到 OpenAI 官方账户前", activate_codex_official)
 }
 
 #[tauri::command]
@@ -1549,6 +1588,12 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       app_get_state,
       app_get_tools,
+      app_get_codex_auth_status,
+      app_start_codex_login,
+      app_cancel_codex_login,
+      app_logout_codex,
+      app_open_codex_device_auth_page,
+      app_activate_codex_official,
       app_check_update,
       app_install_update,
       app_cancel_update,

@@ -2,11 +2,12 @@
 
 AI8888 Tools is a Tauri desktop client for managing AI8888 API configuration across local coding tools. It can synchronize account, subscription, group, and API key information, write local configuration for Codex, Claude Code, OpenCode, OpenClaw, and Hermes, manage local routing, browse and resume local Codex sessions, and check for application updates from GitHub Releases.
 
-Current version: v0.0.6
+Current version: v0.0.7
 
 ## Features
 
 - Account login and API key management for AI8888.
+- Official Codex ChatGPT browser/device login, status, logout, and transactional OpenAI/AI8888 switching.
 - Multi-tool configuration writing for Codex, Claude Code, OpenCode, OpenClaw, and Hermes.
 - Endpoint probing across AI8888 domains for regions where some domains may be blocked.
 - Standalone Codex session manager with browsing, multi-select resume, and session visibility repair.
@@ -31,8 +32,8 @@ GitHub Actions verifies every `master` push, builds Windows / Linux / macOS inst
 2. Create and push a version tag, for example:
 
 ```bash
-git tag v0.0.6
-git push origin v0.0.6
+git tag v0.0.7
+git push origin v0.0.7
 ```
 
 3. GitHub Actions workflow `Build and release desktop packages` will:
