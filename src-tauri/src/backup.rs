@@ -114,7 +114,8 @@ fn collect_skill_files(root: &Path, current: &Path, result: &mut Vec<ExportFile>
       let bytes = fs::read(entry.path()).map_err(|error| AppError::io(&entry.path(), error))?;
       *total = total.saturating_add(bytes.len());
       if *total > MAX_EXPORT_BYTES { return Err(AppError::Message("skill export exceeds 64 MB".into())); }
-      let relative = entry.path().strip_prefix(root).map_err(|_| AppError::Message("invalid skill export path".into()))?;
+      let entry_path = entry.path();
+      let relative = entry_path.strip_prefix(root).map_err(|_| AppError::Message("invalid skill export path".into()))?;
       result.push(ExportFile { path: relative.to_string_lossy().replace('\\', "/"), content: BASE64.encode(bytes) });
     }
   }
