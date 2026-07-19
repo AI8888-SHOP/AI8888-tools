@@ -36,7 +36,7 @@ use unified_sessions::{app_get_unified_session_messages, app_list_unified_sessio
 use usage::{app_clear_usage, app_get_usage_dashboard};
 use workspace::{app_apply_project, app_delete_mcp_server, app_delete_project, app_delete_prompt, app_delete_skill, app_get_workspace, app_import_mcp_from_app, app_install_skill, app_save_mcp_server, app_save_model_price, app_save_project, app_save_prompt, app_save_proxy_settings, app_sync_mcp_servers, app_update_skill_apps};
 
-const CURRENT_APP_VERSION: &str = "v0.1.0";
+const CURRENT_APP_VERSION: &str = "v0.1.1";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
@@ -1107,10 +1107,13 @@ async fn apply_login_result(state: &State<'_, SharedState>, result: LoginResult)
   if let Ok(profile) = state.api.get_profile(&result.session.access_token).await {
     account = merge_account(account, profile);
   }
-  let subscriptions = state.api.get_subscriptions(&result.session.access_token).await.unwrap_or_default();
+  let subscriptions = state.api.get_subscriptions(&result.session.access_token).await
+    .map_err(|err| AppError::Message(format!("无法确认订阅状态，请稍后重试：{err}")))?;
   let subscription_progress = state.api.get_subscription_progress(&result.session.access_token).await.unwrap_or_default();
-  let api_groups = state.api.get_groups(&result.session.access_token).await.unwrap_or_default();
-  let keys = state.api.get_keys(&result.session.access_token).await.unwrap_or_default();
+  let api_groups = state.api.get_groups(&result.session.access_token).await
+    .map_err(|err| AppError::Message(format!("无法确认额度分组，请稍后重试：{err}")))?;
+  let keys = state.api.get_keys(&result.session.access_token).await
+    .map_err(|err| AppError::Message(format!("无法读取访问密钥，请稍后重试：{err}")))?;
   let groups = merge_groups(api_groups, &subscriptions, &keys);
 
   let mut guard = state.data.write().await;
@@ -1217,10 +1220,13 @@ async fn app_load_remote_state(state: State<'_, SharedState>) -> Result<AppState
   };
 
   let profile = state.api.get_profile(&token).await.unwrap_or_else(|_| account.clone());
-  let subscriptions = state.api.get_subscriptions(&token).await.unwrap_or_default();
+  let subscriptions = state.api.get_subscriptions(&token).await
+    .map_err(|err| format!("无法确认订阅状态，请稍后重试：{err}"))?;
   let subscription_progress = state.api.get_subscription_progress(&token).await.unwrap_or_default();
-  let api_groups = state.api.get_groups(&token).await.unwrap_or_default();
-  let keys = state.api.get_keys(&token).await.unwrap_or_default();
+  let api_groups = state.api.get_groups(&token).await
+    .map_err(|err| format!("无法确认额度分组，请稍后重试：{err}"))?;
+  let keys = state.api.get_keys(&token).await
+    .map_err(|err| format!("无法读取访问密钥，请稍后重试：{err}"))?;
   let groups = merge_groups(api_groups, &subscriptions, &keys);
 
   let mut guard = state.data.write().await;

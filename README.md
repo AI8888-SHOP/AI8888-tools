@@ -2,7 +2,7 @@
 
 AI8888 Tools is a Tauri desktop client for managing AI8888 and official OpenAI configuration across local coding tools. It synchronizes account, subscription, group, and API key information; manages routing, MCP, prompts, skills, projects, usage, backups, and local sessions; and ships cross-platform updates through GitHub Releases.
 
-Current version: v0.1.0
+Current version: v0.1.1
 
 ## Features
 
@@ -26,7 +26,7 @@ Current version: v0.1.0
 - Reusable configuration Profiles for endpoint, Key, model, target tool, and local-routing rules, with one-click transactional apply.
 - Account usage and subscription expiry alerts with dismiss actions (auto-refresh every 15 minutes while logged in, plus on window focus).
 - Codex session visibility repair and direct resume launch remain available inside the unified session manager.
-- First-run setup wizard for endpoint probe, tool/key selection, and config write.
+- First-run setup wizard for official OpenAI or AI8888 login, automatic subscription-first funding selection, connection preparation, and config write.
 
 ## Packaging policy
 
@@ -40,8 +40,8 @@ GitHub Actions verifies every `master` push, builds Windows x64/ARM64, Linux x64
 2. Create and push a version tag, for example:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 3. GitHub Actions workflow `Build and release desktop packages` will:

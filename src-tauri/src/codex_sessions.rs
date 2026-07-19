@@ -8,6 +8,8 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(target_os = "windows")]
+use crate::codex_auth::{command_for_executable, resolve_codex_executable};
 use crate::config::{atomic_write, path_for};
 use crate::error::AppError;
 
@@ -297,8 +299,9 @@ pub fn launch_resume(session_id: &str, cwd: Option<&str>, model_provider_key: Op
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 
-    let mut command = std::process::Command::new("cmd");
-    command.args(["/D", "/K", "codex", "resume"]);
+    let (executable, _) = resolve_codex_executable().map_err(AppError::Message)?;
+    let mut command = command_for_executable(&executable);
+    command.arg("resume");
     if let Some(provider) = model_provider_key {
       command.args(["-c", &format!("model_provider={provider}")]);
     }
