@@ -418,6 +418,8 @@ pub struct AppPreferences {
   #[serde(default)]
   pub onboarding_step: u32,
   #[serde(default)]
+  pub onboarding_mode: Option<String>,
+  #[serde(default)]
   pub dismissed_alert_ids: Vec<String>,
 }
 

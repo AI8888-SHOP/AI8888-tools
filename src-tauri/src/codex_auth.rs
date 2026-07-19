@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -183,7 +183,7 @@ impl CodexAuthManager {
         guard.cancel_requested = true;
         guard.result = Some("正在取消 Codex 登录".into());
         if let Some(child) = guard.child.as_mut() {
-          child.kill().map_err(|error| format!("取消 Codex 登录失败：{error}"))?;
+          terminate_child(child).map_err(|error| format!("取消 Codex 登录失败：{error}"))?;
         }
       }
     }
@@ -217,7 +217,7 @@ impl Drop for CodexAuthManager {
   fn drop(&mut self) {
     let mut guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(child) = guard.child.as_mut() {
-      let _ = child.kill();
+      let _ = terminate_child(child);
     }
   }
 }
@@ -240,7 +240,7 @@ pub fn open_device_auth_page() -> Result<(), String> {
   Ok(())
 }
 
-fn resolve_codex_executable() -> Result<(PathBuf, String), String> {
+pub(crate) fn resolve_codex_executable() -> Result<(PathBuf, String), String> {
   let mut candidates = Vec::<PathBuf>::new();
   if let Some(configured) = std::env::var_os("CODEX_BIN").filter(|value| !value.is_empty()) {
     candidates.push(PathBuf::from(configured));
@@ -263,6 +263,7 @@ fn resolve_codex_executable() -> Result<(PathBuf, String), String> {
   }
   #[cfg(windows)]
   {
+    add_windows_codex_candidates(&mut candidates);
     if let Some(app_data) = std::env::var_os("APPDATA") {
       candidates.push(PathBuf::from(app_data).join("npm").join("codex.cmd"));
     }
@@ -289,6 +290,42 @@ fn resolve_codex_executable() -> Result<(PathBuf, String), String> {
   Err(last_error.unwrap_or_else(|| "未检测到 Codex CLI，请先安装或将 codex 加入 PATH".into()))
 }
 
+#[cfg(windows)]
+fn add_windows_codex_candidates(candidates: &mut Vec<PathBuf>) {
+  let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else { return; };
+  let root = PathBuf::from(local_app_data).join("OpenAI").join("Codex").join("bin");
+
+  // The desktop app keeps the current CLI in a changing hash-named directory.
+  // Prefer the newest readable copy, then fall back to the older flat install.
+  let mut versioned = std::fs::read_dir(&root)
+    .ok()
+    .into_iter()
+    .flat_map(|entries| entries.filter_map(Result::ok))
+    .filter_map(|entry| {
+      if !entry.file_type().ok()?.is_dir() {
+        return None;
+      }
+      let executable = entry.path().join("codex.exe");
+      if !executable.is_file() {
+        return None;
+      }
+      let modified = executable
+        .metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+      Some((modified, executable))
+    })
+    .collect::<Vec<_>>();
+  versioned.sort_by(|left, right| right.0.cmp(&left.0));
+  candidates.extend(versioned.into_iter().map(|(_, path)| path));
+  candidates.push(root.join("codex.exe"));
+  candidates.push(root.join("codex.cmd"));
+}
+
 fn run_codex(executable: &PathBuf, args: &[&str]) -> Result<Output, String> {
   let mut command = hidden_command(executable);
   command.args(args).stdin(Stdio::null());
@@ -301,8 +338,18 @@ fn run_codex(executable: &PathBuf, args: &[&str]) -> Result<Output, String> {
   })
 }
 
-fn hidden_command(executable: &PathBuf) -> Command {
-  let mut command = Command::new(executable);
+pub(crate) fn command_for_executable(executable: &Path) -> Command {
+  #[cfg(windows)]
+  if executable.extension().and_then(|value| value.to_str()).map(|value| value.eq_ignore_ascii_case("cmd") || value.eq_ignore_ascii_case("bat")).unwrap_or(false) {
+    let mut command = Command::new("cmd.exe");
+    command.args(["/D", "/C", "call"]).arg(executable);
+    return command;
+  }
+  Command::new(executable)
+}
+
+fn hidden_command(executable: &Path) -> Command {
+  let mut command = command_for_executable(executable);
   #[cfg(windows)]
   {
     use std::os::windows::process::CommandExt;
@@ -310,6 +357,31 @@ fn hidden_command(executable: &PathBuf) -> Command {
     command.creation_flags(CREATE_NO_WINDOW);
   }
   command
+}
+
+fn terminate_child(child: &mut Child) -> std::io::Result<()> {
+  #[cfg(windows)]
+  {
+    // npm installs run through cmd.exe; taskkill /T also stops the spawned
+    // Node/Codex process so a canceled login cannot finish in the background.
+    let pid = child.id().to_string();
+    let mut command = hidden_command(Path::new("taskkill.exe"));
+    let status = command
+      .args(["/PID", &pid, "/T", "/F"])
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .status();
+    if matches!(status, Ok(exit) if exit.success()) {
+      return Ok(());
+    }
+  }
+  match child.kill() {
+    Ok(()) => Ok(()),
+    // The waiter may have reaped the process between taskkill and fallback.
+    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+    Err(error) => Err(error),
+  }
 }
 
 fn spawn_output_reader<R>(reader: R, state: Arc<Mutex<LoginProcessState>>)
