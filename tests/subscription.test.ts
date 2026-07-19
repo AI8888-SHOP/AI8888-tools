@@ -42,8 +42,16 @@ assert(quotaLine(sub, progressValue).includes("\u5269\u4f59"), "quota line");
 const daily = usageWindow(sub, progressValue, "daily");
 assert(daily.used === 9, "daily used");
 const alerts = buildAccountAlerts({ balance: 0.5, subscriptions: [sub], subscriptionProgress: progress });
-assert(alerts.some((item) => item.title.includes("\u4f59\u989d")), "balance alert");
+assert(!alerts.some((item) => item.title.includes("\u4f59\u989d")), "active subscription suppresses irrelevant balance alert");
 assert(alerts.some((item) => item.title.includes("\u5230\u671f") || item.title.includes("\u989d\u5ea6")), "expiry/usage alert");
+const balanceOnlyAlerts = buildAccountAlerts({ balance: 0.5, subscriptions: [], subscriptionProgress: [] });
+assert(balanceOnlyAlerts.some((item) => item.title.includes("\u4f59\u989d")), "balance alert remains for pay-as-you-go accounts");
+const otherPlatformAlerts = buildAccountAlerts({
+  balance: 0.5,
+  subscriptions: [{ id: 12, status: "active", group: { id: 12, name: "Claude", platform: "anthropic" } }],
+  subscriptionProgress: [],
+});
+assert(otherPlatformAlerts.some((item) => item.title.includes("\u4f59\u989d")), "non-Codex subscription must not suppress Codex balance alert");
 const subscriptions: SubscriptionSummary[] = [
   { id: 2, status: "active", groupId: 22, expiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString() },
   { id: 3, status: "active", groupId: 11, expiresAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000).toISOString() },

@@ -163,6 +163,19 @@ input:focus, select:focus, textarea:focus { border-color: rgba(72, 200, 120, .68
 .metrics small { display: block; margin-bottom: 6px; color: var(--muted); font-size: 11px; }
 .metrics strong { font-size: 18px; }
 
+.homeView { display: grid; gap: 16px; }
+.homeView > .panel { margin-bottom: 0; }
+.readinessPanel { border-color: rgba(213, 163, 61, .34); }
+.readinessPanel.ready { border-color: rgba(72, 200, 120, .4); }
+.readinessGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--border); border-radius: 7px; }
+.readinessGrid > div { min-width: 0; padding: 13px 14px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.readinessGrid > div:nth-child(2n) { border-right: 0; }
+.readinessGrid > div:nth-last-child(-n + 2) { border-bottom: 0; }
+.readinessGrid span, .readinessGrid strong { display: block; }
+.readinessGrid span { margin-bottom: 5px; color: var(--muted); font-size: 10px; }
+.readinessGrid strong { overflow-wrap: anywhere; font-size: 13px; }
+.readinessPanel .inlineAlert { margin: 14px 0 0; }
+
 .connectionPanel { max-width: 760px; }
 .connectionSummary { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 16px; padding: 14px 16px; border: 1px solid rgba(72, 200, 120, .26); border-radius: 8px; background: var(--accent-soft); }
 .connectionSummary > div:first-child { min-width: 0; display: flex; align-items: center; gap: 10px; }
@@ -411,7 +424,10 @@ button.wizardOption.active { color: #e9fff0; background: var(--accent-soft); bor
   .wizardStep { grid-template-columns: 21px minmax(0, 1fr); gap: 4px; }
   .wizardStep span { width: 20px; height: 20px; }
   .wizardStep small { font-size: 9px; }
-  .wizardOptions, .wizardSummary { grid-template-columns: 1fr; }
+  .wizardOptions, .wizardSummary, .readinessGrid { grid-template-columns: 1fr; }
+  .readinessGrid > div { border-right: 0; border-bottom: 1px solid var(--border); }
+  .readinessGrid > div:nth-last-child(-n + 2) { border-bottom: 1px solid var(--border); }
+  .readinessGrid > div:last-child { border-bottom: 0; }
   .wizardCreateKey { grid-template-columns: 1fr; }
   .wizardCheck { grid-template-columns: auto minmax(0, 1fr); }
   .wizardCheck button { grid-column: 2; justify-self: start; }

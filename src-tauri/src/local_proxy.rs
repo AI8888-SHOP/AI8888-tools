@@ -15,19 +15,21 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::task::JoinHandle;
 
 use crate::config::{normalize_api_base_url, LOCAL_PROXY_BASE_URL};
 use crate::error::AppError;
-use crate::models::SwitchTarget;
+use crate::models::{AppStateData, LocalRouteManifest, SwitchTarget};
 use crate::tools::build_local_route_manifest;
 use crate::usage::{record_usage, UsageRecord};
-use crate::workspace::{load_proxy_settings, ProxySettings};
+use crate::workspace::{load_proxy_settings, load_proxy_settings_checked, ProxySettings};
 
 #[derive(Debug, Clone)]
 struct ProxyRouteConfig {
     base_url: String,
     api_key: String,
+    inbound_token: String,
     default_model: String,
     model_map: HashMap<String, String>,
 }
@@ -62,17 +64,47 @@ pub struct ProxyEndpointHealth {
     pub error: Option<String>,
 }
 
+/// Runtime state of the local listener.  This is deliberately separate from
+/// endpoint health: a listener can be healthy while all upstreams are down,
+/// and a bind failure must remain visible until the next retry succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalProxyStatus {
+    pub running: bool,
+    pub ready: bool,
+    pub address: String,
+    pub last_error: Option<String>,
+    pub generation: u64,
+}
+
+struct ProxyRuntime {
+    task: Option<JoinHandle<()>>,
+    status: LocalProxyStatus,
+}
+
 struct UpstreamResponse {
     response: reqwest::Response,
     endpoint: EndpointCandidate,
 }
 
 static PROXY_CONFIG: OnceLock<RwLock<Option<ProxyRouteConfig>>> = OnceLock::new();
-static PROXY_STARTED: OnceLock<()> = OnceLock::new();
+static PROXY_RUNTIME: OnceLock<Mutex<ProxyRuntime>> = OnceLock::new();
 static CIRCUITS: OnceLock<RwLock<HashMap<String, CircuitState>>> = OnceLock::new();
 
 fn config_lock() -> &'static RwLock<Option<ProxyRouteConfig>> {
     PROXY_CONFIG.get_or_init(|| RwLock::new(None))
+}
+
+fn runtime_lock() -> &'static Mutex<ProxyRuntime> {
+    PROXY_RUNTIME.get_or_init(|| {
+        Mutex::new(ProxyRuntime {
+            task: None,
+            status: LocalProxyStatus {
+                address: LOCAL_PROXY_BASE_URL.to_string(),
+                ..Default::default()
+            },
+        })
+    })
 }
 
 fn circuit_lock() -> &'static RwLock<HashMap<String, CircuitState>> {
@@ -86,53 +118,377 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Reconstruct the proxy-only portion of the last local route during app
+/// startup.  The manifest supplies the routed apps/models, while AppStateData
+/// supplies the selected AI8888 key.  A manual-profile key can be supplied by
+/// the caller as an override after resolving that profile from the private
+/// profile store.
+pub fn build_local_proxy_recovery_target(
+    manifest: &LocalRouteManifest,
+    state: &AppStateData,
+    fallback_upstream_base_url: &str,
+    api_key_override: Option<&str>,
+) -> Result<SwitchTarget, AppError> {
+    let mut apps = Vec::new();
+    let mut model_map = HashMap::new();
+    let mut model = None;
+    for entry in manifest.entries.iter().filter(|entry| entry.enabled) {
+        if !matches!(entry.app.as_str(), "codex" | "claude" | "opencode") {
+            continue;
+        }
+        if !apps.contains(&entry.app) {
+            apps.push(entry.app.clone());
+        }
+        if model.is_none() {
+            model = entry
+                .model
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned();
+        }
+        for (role, mapped_model) in &entry.model_map {
+            if matches!(role.as_str(), "sonnet" | "opus" | "haiku")
+                && !mapped_model.trim().is_empty()
+            {
+                model_map.insert(role.clone(), mapped_model.clone());
+            }
+        }
+    }
+    if apps.is_empty() {
+        return Err(AppError::Message(
+            "local route manifest has no enabled supported apps".into(),
+        ));
+    }
+    let base_url = manifest
+        .upstream_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_upstream_base_url)
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if base_url.is_empty() {
+        return Err(AppError::Message(
+            "local proxy recovery requires an upstream base URL".into(),
+        ));
+    }
+    let selected_key = state.selected_key_id.and_then(|selected_key_id| {
+        state
+            .keys
+            .items
+            .iter()
+            .find(|key| key.id == selected_key_id)
+            .and_then(|key| key.key.as_deref())
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    });
+    let api_key = api_key_override
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .or(selected_key)
+        .ok_or_else(|| {
+            AppError::Message(
+                "local proxy recovery cannot resolve the previously selected API key".into(),
+            )
+        })?
+        .to_string();
+    let tool = if apps.iter().any(|app| app == &state.selected_tool) {
+        state.selected_tool.clone()
+    } else {
+        apps[0].clone()
+    };
+
+    Ok(SwitchTarget {
+        tool,
+        profile_name: if manifest.profile_name.trim().is_empty() {
+            "Recovered local route".into()
+        } else {
+            manifest.profile_name.clone()
+        },
+        base_url,
+        api_key,
+        model: model.clone(),
+        review_model: model,
+        token_type: None,
+        local_routing_enabled: true,
+        local_route_apps: apps,
+        local_route_model_map: model_map,
+        // A routed client must present the proxy token. The original Claude
+        // credential remains recoverable from the managed config backup.
+        local_route_preserve_claude_auth: false,
+        local_route_only: true,
+    })
+}
+
+pub async fn restore_local_proxy_from_state(
+    manifest: &LocalRouteManifest,
+    state: &AppStateData,
+    fallback_upstream_base_url: &str,
+    api_key_override: Option<&str>,
+) -> Result<LocalProxyStatus, AppError> {
+    let target = match build_local_proxy_recovery_target(
+        manifest,
+        state,
+        fallback_upstream_base_url,
+        api_key_override,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            let mut runtime = runtime_lock().lock().await;
+            runtime.status.running = false;
+            runtime.status.ready = false;
+            runtime.status.last_error = Some(error.to_string());
+            return Err(error);
+        }
+    };
+    if let Err(error) = ensure_local_proxy(&target).await {
+        let mut runtime = runtime_lock().lock().await;
+        runtime.status.running = false;
+        runtime.status.ready = false;
+        runtime.status.last_error = Some(error.to_string());
+        return Err(error);
+    }
+    Ok(runtime_lock().lock().await.status.clone())
+}
+
+async fn bind_proxy_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| format!("bind {addr} failed: {error}"))
+}
+
+/// Validate the bearer token on requests entering the local listener.
+/// Keeping this as a small pure function makes the security contract easy to
+/// test without starting an axum server or touching the user's workspace.
+fn authorize_inbound(headers: &HeaderMap, configured_token: &str) -> Result<(), Response> {
+    let expected = configured_token.trim();
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let (scheme, token) = value.split_once(char::is_whitespace)?;
+            scheme
+                .eq_ignore_ascii_case("Bearer")
+                .then_some(token.trim())
+        })
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+        })
+        .unwrap_or_default();
+    if !expected.is_empty() && constant_time_token_eq(provided.as_bytes(), expected.as_bytes()) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
+        Json(json!({
+            "error": {
+                "type": "authentication_error",
+                "message": "local proxy requires a valid bearer token"
+            }
+        })),
+    )
+        .into_response())
+}
+
+async fn authorize_configured_inbound(headers: &HeaderMap) -> Result<(), Response> {
+    let configured_token = config_lock()
+        .read()
+        .await
+        .as_ref()
+        .map(|config| config.inbound_token.clone())
+        .unwrap_or_default();
+    authorize_inbound(headers, &configured_token)
+}
+
+fn constant_time_token_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (*left ^ *right)
+        })
+        == 0
+}
+
+#[tauri::command]
+pub async fn app_get_local_proxy_status() -> LocalProxyStatus {
+    runtime_lock().lock().await.status.clone()
+}
+
+/// Stop and start the listener using the last configured route.  This is
+/// useful after a port collision is resolved and also provides the UI a
+/// deterministic recovery action without requiring another profile switch.
+#[tauri::command]
+pub async fn app_restart_local_proxy() -> Result<LocalProxyStatus, String> {
+    if config_lock().read().await.is_none() {
+        return Err("local proxy is not configured".into());
+    }
+    stop_proxy().await;
+    start_proxy().await.map_err(|error| error.to_string())?;
+    Ok(runtime_lock().lock().await.status.clone())
+}
+
+pub async fn stop_local_proxy() {
+    *config_lock().write().await = None;
+    stop_proxy().await;
+}
+
 pub async fn ensure_local_proxy(target: &SwitchTarget) -> Result<(), AppError> {
     let manifest = build_local_route_manifest(target);
     if manifest.entries.is_empty() {
         return Ok(());
     }
 
+    let inbound_token = load_proxy_settings_checked()?.local_proxy_token;
+    if inbound_token.trim().is_empty() {
+        return Err(AppError::Message(
+            "local proxy bearer token is not configured".into(),
+        ));
+    }
     let cfg = ProxyRouteConfig {
         base_url: normalize_api_base_url(&target.base_url),
         api_key: target.api_key.clone(),
+        inbound_token,
         default_model: target
             .model
             .clone()
             .unwrap_or_else(|| "gpt-5.5".to_string()),
         model_map: target.local_route_model_map.clone(),
     };
-    *config_lock().write().await = Some(cfg);
-
-    PROXY_STARTED.get_or_init(|| {
-        tokio::spawn(async move {
-            if let Err(err) = run_proxy().await {
-                eprintln!("local proxy stopped: {err}");
-            }
-        });
-    });
-
-    Ok(())
+    let previous = {
+        let mut configured = config_lock().write().await;
+        configured.replace(cfg)
+    };
+    match start_proxy().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A failed bind must not leave a route in memory after the file
+            // transaction rolls back. Otherwise a later manual restart could
+            // start a proxy that no client configuration points to.
+            *config_lock().write().await = previous;
+            Err(error)
+        }
+    }
 }
 
-async fn run_proxy() -> Result<(), String> {
+async fn start_proxy() -> Result<(), AppError> {
+    let mut runtime = runtime_lock().lock().await;
+    if runtime
+        .task
+        .as_ref()
+        .is_some_and(|task| !task.is_finished() && runtime.status.ready)
+    {
+        return Ok(());
+    }
+
+    // A finished task is intentionally discarded.  The next start attempt
+    // must bind again so a transient bind/runtime failure remains retryable.
+    if runtime.task.as_ref().is_some_and(|task| task.is_finished()) {
+        runtime.task.take();
+    }
+
+    runtime.status.generation = runtime.status.generation.saturating_add(1);
+    let generation = runtime.status.generation;
+    runtime.status.running = false;
+    runtime.status.ready = false;
+    runtime.status.last_error = None;
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+    let task = tokio::spawn(async move {
+        let result = run_proxy(ready_tx).await;
+        let mut runtime = runtime_lock().lock().await;
+        if runtime.status.generation == generation {
+            runtime.status.running = false;
+            runtime.status.ready = false;
+            if let Err(error) = result {
+                runtime.status.last_error = Some(error.clone());
+                eprintln!("local proxy stopped: {error}");
+            }
+        }
+    });
+    runtime.task = Some(task);
+
+    // Keep the runtime lock until bind-ready is received.  This serializes
+    // concurrent ensure calls and prevents two listeners racing to bind.
+    match ready_rx.await {
+        Ok(Ok(())) => {
+            runtime.status.running = true;
+            runtime.status.ready = true;
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            runtime.status.running = false;
+            runtime.status.ready = false;
+            runtime.status.last_error = Some(error.clone());
+            if let Some(task) = runtime.task.take() {
+                task.abort();
+            }
+            Err(AppError::Message(error))
+        }
+        Err(_) => {
+            let error = "local proxy stopped before it became ready".to_string();
+            runtime.status.running = false;
+            runtime.status.ready = false;
+            runtime.status.last_error = Some(error.clone());
+            if let Some(task) = runtime.task.take() {
+                task.abort();
+            }
+            Err(AppError::Message(error))
+        }
+    }
+}
+
+async fn stop_proxy() {
+    let task = {
+        let mut runtime = runtime_lock().lock().await;
+        runtime.status.generation = runtime.status.generation.saturating_add(1);
+        runtime.status.running = false;
+        runtime.status.ready = false;
+        runtime.task.take()
+    };
+    if let Some(task) = task {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+async fn run_proxy(ready_tx: oneshot::Sender<Result<(), String>>) -> Result<(), String> {
     let app = Router::new()
         .route("/v1/messages", post(handle_claude_messages))
         .route("/v1/models", get(handle_openai_passthrough))
         .route("/v1/chat/completions", post(handle_openai_passthrough))
         .route("/v1/responses", post(handle_openai_passthrough));
-    let addr: SocketAddr = LOCAL_PROXY_BASE_URL
-        .trim_start_matches("http://")
-        .parse()
-        .map_err(|err| format!("invalid local proxy addr: {err}"))?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|err| format!("bind {LOCAL_PROXY_BASE_URL} failed: {err}"))?;
+    let addr: SocketAddr = match LOCAL_PROXY_BASE_URL.trim_start_matches("http://").parse() {
+        Ok(addr) => addr,
+        Err(error) => {
+            let message = format!("invalid local proxy addr: {error}");
+            let _ = ready_tx.send(Err(message.clone()));
+            return Err(message);
+        }
+    };
+    let listener = match bind_proxy_listener(addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let _ = ready_tx.send(Ok(()));
     axum::serve(listener, app)
         .await
         .map_err(|err| err.to_string())
 }
 
-async fn handle_claude_messages(Json(body): Json<Value>) -> Response {
+async fn handle_claude_messages(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(response) = authorize_configured_inbound(&headers).await {
+        return response;
+    }
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     match proxy_claude_messages(body, wants_stream).await {
         Ok(response) => response,
@@ -150,6 +506,9 @@ async fn handle_openai_passthrough(
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Response {
+    if let Err(response) = authorize_configured_inbound(&headers).await {
+        return response;
+    }
     match proxy_openai_request(method, headers, uri, body).await {
         Ok(response) => response,
         Err((status, message)) => {
@@ -1409,6 +1768,7 @@ pub async fn app_probe_proxy_endpoints() -> Result<Vec<ProxyEndpointHealth>, Str
     let fallback_cfg = ProxyRouteConfig {
         base_url: String::new(),
         api_key: String::new(),
+        inbound_token: String::new(),
         default_model: String::new(),
         model_map: HashMap::new(),
     };
@@ -1517,6 +1877,7 @@ mod tests {
         ProxyRouteConfig {
             base_url: "https://example.test/v1".to_string(),
             api_key: "sk-test".to_string(),
+            inbound_token: "configured-token".to_string(),
             default_model: "gpt-default".to_string(),
             model_map: HashMap::from([
                 ("sonnet".to_string(), "gpt-sonnet".to_string()),
@@ -1550,6 +1911,162 @@ mod tests {
             upstream_openai_url("https://example.test/v1", &uri),
             "https://example.test/v1/responses?stream=true"
         );
+    }
+
+    #[tokio::test]
+    async fn bind_failure_is_reported_and_can_be_retried() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve local port");
+        let addr = occupied.local_addr().expect("reserved address");
+
+        let error = match bind_proxy_listener(addr).await {
+            Ok(_) => panic!("second listener unexpectedly bound the occupied address"),
+            Err(error) => error,
+        };
+        assert!(error.contains("bind"));
+        assert!(error.contains(&addr.to_string()));
+
+        drop(occupied);
+        let retry = bind_proxy_listener(addr)
+            .await
+            .expect("released address should be bindable on the next attempt");
+        drop(retry);
+    }
+
+    #[test]
+    fn inbound_auth_rejects_missing_and_wrong_bearer_tokens() {
+        let missing = authorize_inbound(&HeaderMap::new(), "configured-token")
+            .expect_err("missing token must be rejected");
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing.headers().get(header::WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static("Bearer"))
+        );
+
+        let mut wrong_headers = HeaderMap::new();
+        wrong_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        let wrong = authorize_inbound(&wrong_headers, "configured-token")
+            .expect_err("wrong token must be rejected");
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn inbound_auth_accepts_the_configured_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer configured-token"),
+        );
+        authorize_inbound(&headers, "configured-token")
+            .expect("configured token should be accepted");
+    }
+
+    #[test]
+    fn inbound_auth_accepts_the_configured_anthropic_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("configured-token"));
+        authorize_inbound(&headers, "configured-token")
+            .expect("configured x-api-key should be accepted");
+    }
+
+    #[test]
+    fn rebuilds_proxy_target_from_manifest_and_selected_key() {
+        let manifest = LocalRouteManifest {
+            profile_name: "ai8888-local-route".into(),
+            entries: vec![
+                crate::models::LocalRouteEntry {
+                    app: "codex".into(),
+                    enabled: true,
+                    model: Some("gpt-main".into()),
+                    ..Default::default()
+                },
+                crate::models::LocalRouteEntry {
+                    app: "claude".into(),
+                    enabled: true,
+                    model_map: HashMap::from([("sonnet".into(), "gpt-sonnet".into())]),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut state = AppStateData {
+            selected_tool: "codex".into(),
+            selected_key_id: Some(7),
+            ..Default::default()
+        };
+        state.keys.items.push(crate::models::ApiKeySummary {
+            id: 7,
+            key: Some("sk-selected".into()),
+            ..Default::default()
+        });
+
+        let target =
+            build_local_proxy_recovery_target(&manifest, &state, "https://sub.ai8888.shop/", None)
+                .expect("recovery target");
+        assert_eq!(target.api_key, "sk-selected");
+        assert_eq!(target.base_url, "https://sub.ai8888.shop");
+        assert_eq!(target.local_route_apps, vec!["codex", "claude"]);
+        assert_eq!(target.model.as_deref(), Some("gpt-main"));
+        assert_eq!(
+            target
+                .local_route_model_map
+                .get("sonnet")
+                .map(String::as_str),
+            Some("gpt-sonnet")
+        );
+    }
+
+    #[test]
+    fn recovery_prefers_the_manifest_upstream_over_the_site_fallback() {
+        let manifest = LocalRouteManifest {
+            upstream_base_url: Some("https://custom.example/proxy/".into()),
+            entries: vec![crate::models::LocalRouteEntry {
+                app: "codex".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let target = build_local_proxy_recovery_target(
+            &manifest,
+            &AppStateData::default(),
+            "https://endpoint-probe.example",
+            Some("sk-profile"),
+        )
+        .expect("recovery target");
+
+        assert_eq!(target.base_url, "https://custom.example/proxy");
+    }
+
+    #[test]
+    fn recovery_requires_an_explicit_or_selected_key() {
+        let manifest = LocalRouteManifest {
+            entries: vec![crate::models::LocalRouteEntry {
+                app: "codex".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = AppStateData::default();
+        let error =
+            build_local_proxy_recovery_target(&manifest, &state, "https://sub.ai8888.shop", None)
+                .expect_err("missing key must not be guessed");
+        assert!(error.to_string().contains("previously selected API key"));
+
+        let target = build_local_proxy_recovery_target(
+            &manifest,
+            &state,
+            "https://sub.ai8888.shop",
+            Some("sk-manual"),
+        )
+        .expect("manual profile override");
+        assert_eq!(target.api_key, "sk-manual");
     }
 
     #[test]

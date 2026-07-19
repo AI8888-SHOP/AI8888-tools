@@ -24,6 +24,16 @@ pub struct CodexAuthStatus {
   pub status_message: String,
   pub active_provider: String,
   pub ai8888_config_available: bool,
+  pub config_exists: bool,
+  pub config_valid: bool,
+  pub config_error: Option<String>,
+  pub configured_model: Option<String>,
+  pub configured_review_model: Option<String>,
+  pub configured_base_url: Option<String>,
+  pub configured_key_id: Option<u64>,
+  pub configured_key_name: Option<String>,
+  #[serde(skip_serializing)]
+  pub(crate) configured_api_key: Option<String>,
   pub credential_store: String,
   pub config_path: String,
   pub login_running: bool,
@@ -57,15 +67,9 @@ impl CodexAuthManager {
   pub fn status(&self) -> CodexAuthStatus {
     let runtime = {
       let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-      (
-        guard.running,
-        guard.mode.clone(),
-        guard.result.clone(),
-        guard.succeeded,
-        guard.output.iter().cloned().collect::<Vec<_>>(),
-      )
+      (guard.running, guard.mode.clone(), guard.result.clone(), guard.succeeded, guard.output.iter().cloned().collect::<Vec<_>>())
     };
-    let (active_provider, ai8888_config_available, credential_store) = inspect_codex_config();
+    let config = inspect_codex_config();
 
     match resolve_codex_executable() {
       Ok((executable, version)) => {
@@ -76,9 +80,18 @@ impl CodexAuthManager {
             authenticated: false,
             auth_method: "checking".into(),
             status_message: "正在等待 Codex 完成官方登录".into(),
-            active_provider,
-            ai8888_config_available,
-            credential_store,
+            active_provider: config.active_provider,
+            ai8888_config_available: config.ai8888_config_available,
+            config_exists: config.config_exists,
+            config_valid: config.config_valid,
+            config_error: config.config_error,
+            configured_model: config.configured_model,
+            configured_review_model: config.configured_review_model,
+            configured_base_url: config.configured_base_url,
+            configured_key_id: None,
+            configured_key_name: None,
+            configured_api_key: config.configured_api_key,
+            credential_store: config.credential_store,
             config_path: path_for("codex", "config.toml").display().to_string(),
             login_running: runtime.0,
             login_mode: runtime.1,
@@ -99,9 +112,18 @@ impl CodexAuthManager {
           authenticated,
           auth_method,
           status_message,
-          active_provider,
-          ai8888_config_available,
-          credential_store,
+          active_provider: config.active_provider,
+          ai8888_config_available: config.ai8888_config_available,
+          config_exists: config.config_exists,
+          config_valid: config.config_valid,
+          config_error: config.config_error,
+          configured_model: config.configured_model,
+          configured_review_model: config.configured_review_model,
+          configured_base_url: config.configured_base_url,
+          configured_key_id: None,
+          configured_key_name: None,
+          configured_api_key: config.configured_api_key,
+          credential_store: config.credential_store,
           config_path: path_for("codex", "config.toml").display().to_string(),
           login_running: runtime.0,
           login_mode: runtime.1,
@@ -116,9 +138,18 @@ impl CodexAuthManager {
         authenticated: false,
         auth_method: "unavailable".into(),
         status_message: error,
-        active_provider,
-        ai8888_config_available,
-        credential_store,
+        active_provider: config.active_provider,
+        ai8888_config_available: config.ai8888_config_available,
+        config_exists: config.config_exists,
+        config_valid: config.config_valid,
+        config_error: config.config_error,
+        configured_model: config.configured_model,
+        configured_review_model: config.configured_review_model,
+        configured_base_url: config.configured_base_url,
+        configured_key_id: None,
+        configured_key_name: None,
+        configured_api_key: config.configured_api_key,
+        credential_store: config.credential_store,
         config_path: path_for("codex", "config.toml").display().to_string(),
         login_running: runtime.0,
         login_mode: runtime.1,
@@ -212,7 +243,6 @@ impl CodexAuthManager {
   }
 }
 
-
 impl Drop for CodexAuthManager {
   fn drop(&mut self) {
     let mut guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -292,7 +322,9 @@ pub(crate) fn resolve_codex_executable() -> Result<(PathBuf, String), String> {
 
 #[cfg(windows)]
 fn add_windows_codex_candidates(candidates: &mut Vec<PathBuf>) {
-  let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else { return; };
+  let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+    return;
+  };
   let root = PathBuf::from(local_app_data).join("OpenAI").join("Codex").join("bin");
 
   // The desktop app keeps the current CLI in a changing hash-named directory.
@@ -309,14 +341,7 @@ fn add_windows_codex_candidates(candidates: &mut Vec<PathBuf>) {
       if !executable.is_file() {
         return None;
       }
-      let modified = executable
-        .metadata()
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
+      let modified = executable.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
       Some((modified, executable))
     })
     .collect::<Vec<_>>();
@@ -340,7 +365,12 @@ fn run_codex(executable: &PathBuf, args: &[&str]) -> Result<Output, String> {
 
 pub(crate) fn command_for_executable(executable: &Path) -> Command {
   #[cfg(windows)]
-  if executable.extension().and_then(|value| value.to_str()).map(|value| value.eq_ignore_ascii_case("cmd") || value.eq_ignore_ascii_case("bat")).unwrap_or(false) {
+  if executable
+    .extension()
+    .and_then(|value| value.to_str())
+    .map(|value| value.eq_ignore_ascii_case("cmd") || value.eq_ignore_ascii_case("bat"))
+    .unwrap_or(false)
+  {
     let mut command = Command::new("cmd.exe");
     command.args(["/D", "/C", "call"]).arg(executable);
     return command;
@@ -366,12 +396,7 @@ fn terminate_child(child: &mut Child) -> std::io::Result<()> {
     // Node/Codex process so a canceled login cannot finish in the background.
     let pid = child.id().to_string();
     let mut command = hidden_command(Path::new("taskkill.exe"));
-    let status = command
-      .args(["/PID", &pid, "/T", "/F"])
-      .stdin(Stdio::null())
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .status();
+    let status = command.args(["/PID", &pid, "/T", "/F"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     if matches!(status, Ok(exit) if exit.success()) {
       return Ok(());
     }
@@ -482,9 +507,7 @@ fn clean_output(output: &Output) -> Option<String> {
 }
 
 fn parse_login_status(output: &Output) -> (bool, String, String) {
-  let message = clean_output(output).unwrap_or_else(|| {
-    if output.status.success() { "Codex 已登录".into() } else { "Codex 尚未登录".into() }
-  });
+  let message = clean_output(output).unwrap_or_else(|| if output.status.success() { "Codex 已登录".into() } else { "Codex 尚未登录".into() });
   let lowered = message.to_ascii_lowercase();
   let authenticated = output.status.success() && !lowered.contains("not logged") && !lowered.contains("signed out");
   let method = if !authenticated {
@@ -499,13 +522,40 @@ fn parse_login_status(output: &Output) -> (bool, String, String) {
   (authenticated, method.into(), message)
 }
 
-fn inspect_codex_config() -> (String, bool, String) {
-  let path = path_for("codex", "config.toml");
-  let value = std::fs::read_to_string(path)
-    .ok()
-    .and_then(|content| content.parse::<toml::Value>().ok())
-    .filter(|value| value.is_table())
-    .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+struct CodexConfigInspection {
+  active_provider: String,
+  ai8888_config_available: bool,
+  config_exists: bool,
+  config_valid: bool,
+  config_error: Option<String>,
+  configured_model: Option<String>,
+  configured_review_model: Option<String>,
+  configured_base_url: Option<String>,
+  configured_api_key: Option<String>,
+  credential_store: String,
+}
+
+fn invalid_codex_config(config_exists: bool, error: String) -> CodexConfigInspection {
+  CodexConfigInspection {
+    active_provider: "invalid".into(),
+    ai8888_config_available: false,
+    config_exists,
+    config_valid: false,
+    config_error: Some(error),
+    configured_model: None,
+    configured_review_model: None,
+    configured_base_url: None,
+    configured_api_key: None,
+    credential_store: "default".into(),
+  }
+}
+
+fn inspect_codex_config_content(content: &str, config_exists: bool) -> CodexConfigInspection {
+  let value = match content.parse::<toml::Value>() {
+    Ok(value) if value.is_table() => value,
+    Ok(_) => return invalid_codex_config(config_exists, "Codex config.toml root must be a table".into()),
+    Err(error) => return invalid_codex_config(config_exists, format!("Codex config.toml parse failed: {error}")),
+  };
   let provider = value.get("model_provider").and_then(toml::Value::as_str).unwrap_or("openai");
   let active_provider = match provider {
     "openai" => "official",
@@ -513,23 +563,72 @@ fn inspect_codex_config() -> (String, bool, String) {
     _ => "custom",
   }
   .to_string();
-  let ai8888_config_available = value
-    .get("model_providers")
-    .and_then(|item| item.get("ai8888"))
-    .and_then(toml::Value::as_table)
-    .map(|table| table.get("base_url").and_then(toml::Value::as_str).is_some() && table.get("experimental_bearer_token").and_then(toml::Value::as_str).is_some())
-    .unwrap_or(false);
-  let credential_store = value
-    .get("cli_auth_credentials_store")
+  let provider_table = value.get("model_providers").and_then(|item| item.get(provider)).and_then(toml::Value::as_table);
+  let configured_base_url = provider_table
+    .and_then(|table| table.get("base_url"))
     .and_then(toml::Value::as_str)
-    .unwrap_or("default")
-    .to_string();
-  (active_provider, ai8888_config_available, credential_store)
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string);
+  let configured_api_key = provider_table
+    .and_then(|table| table.get("experimental_bearer_token"))
+    .and_then(toml::Value::as_str)
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string);
+  let ai8888_config_available = provider == "ai8888" && configured_base_url.is_some() && configured_api_key.is_some();
+  let string_value = |key: &str| value.get(key).and_then(toml::Value::as_str).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+
+  CodexConfigInspection {
+    active_provider,
+    ai8888_config_available,
+    config_exists,
+    config_valid: true,
+    config_error: None,
+    configured_model: string_value("model"),
+    configured_review_model: string_value("review_model"),
+    configured_base_url,
+    configured_api_key,
+    credential_store: string_value("cli_auth_credentials_store").unwrap_or_else(|| "default".into()),
+  }
+}
+
+fn inspect_codex_config() -> CodexConfigInspection {
+  let path = path_for("codex", "config.toml");
+  match std::fs::read_to_string(&path) {
+    Ok(content) => inspect_codex_config_content(&content, true),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => inspect_codex_config_content("", false),
+    Err(error) => invalid_codex_config(path.exists(), format!("Cannot read {}: {error}", path.display())),
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn reports_malformed_codex_config_instead_of_defaulting_to_official() {
+    let status = inspect_codex_config_content("model_provider = \"ai8888\"\n[broken\n", true);
+    assert!(!status.config_valid);
+    assert_eq!(status.active_provider, "invalid");
+    assert!(status.config_error.as_deref().is_some_and(|error| error.contains("parse failed")));
+    assert!(!status.ai8888_config_available);
+  }
+
+  #[test]
+  fn reports_actual_codex_model_provider_and_endpoint() {
+    let status = inspect_codex_config_content(
+      "model = \"gpt-main\"\nreview_model = \"gpt-review\"\nmodel_provider = \"ai8888\"\n[model_providers.ai8888]\nbase_url = \"https://sub.ai8888.shop/v1\"\nexperimental_bearer_token = \"sk-test\"\n",
+      true,
+    );
+    assert!(status.config_valid);
+    assert!(status.ai8888_config_available);
+    assert_eq!(status.active_provider, "ai8888");
+    assert_eq!(status.configured_model.as_deref(), Some("gpt-main"));
+    assert_eq!(status.configured_review_model.as_deref(), Some("gpt-review"));
+    assert_eq!(status.configured_base_url.as_deref(), Some("https://sub.ai8888.shop/v1"));
+    assert_eq!(status.configured_api_key.as_deref(), Some("sk-test"));
+  }
 
   #[test]
   fn redacts_token_bearing_output() {

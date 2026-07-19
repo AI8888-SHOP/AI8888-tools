@@ -117,10 +117,13 @@ export function buildAccountAlerts(input: {
   balance?: number | null;
   subscriptions: SubscriptionSummary[];
   subscriptionProgress: SubscriptionProgressInfo[];
+  tool?: "codex" | "any";
 }) {
   const alerts: AccountAlert[] = [];
   const balance = Number(input.balance ?? 0);
-  if (Number.isFinite(balance) && balance <= 1) {
+  const tool = input.tool ?? "codex";
+  const hasActiveSubscription = input.subscriptions.some((subscription) => isActiveSubscription(subscription) && groupSupportsTool(subscription.group, tool));
+  if (!hasActiveSubscription && Number.isFinite(balance) && balance <= 1) {
     alerts.push({
       id: `balance-${balance.toFixed(4)}`,
       level: balance <= 0 ? "critical" : "warning",

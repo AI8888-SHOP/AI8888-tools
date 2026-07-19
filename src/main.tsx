@@ -18,6 +18,9 @@ type SwitchTarget = { tool: string; profileName: string; baseUrl: string; apiKey
 type LocalRouteEntry = { app: string; enabled: boolean; upstreamName: string; localBaseUrl: string; localApiKey: string; model?: string | null; modelMap?: Record<string, string>; source: string };
 type LocalRouteManifest = { profileName: string; updatedAt: number; entries: LocalRouteEntry[] };
 type LocalRouteStatus = { app: string; detected: boolean; configPath: string; baseUrlMatched: boolean; proxyKeyMatched: boolean; oauthPreserved?: boolean; mcpPreserved?: boolean; detail: string };
+type LocalProxyRuntimeStatus = { running: boolean; ready: boolean; address: string; lastError?: string | null; generation: number };
+type LocalProxyEndpointHealth = { id: string; name: string; baseUrl: string; healthy: boolean; status?: number | null; latencyMs?: number | null; circuitState: string; consecutiveFailures: number; error?: string | null };
+type CodexAuthStatus = { cliAvailable: boolean; cliVersion?: string | null; authenticated: boolean; authMethod: string; statusMessage: string; activeProvider: string; ai8888ConfigAvailable: boolean; configExists?: boolean; configValid?: boolean; configError?: string | null; configuredModel?: string | null; configuredReviewModel?: string | null; configuredBaseUrl?: string | null; configuredKeyId?: number | null; configuredKeyName?: string | null; credentialStore: string; loginRunning: boolean; loginMode?: string | null; loginMessage?: string | null; loginSucceeded?: boolean | null; loginOutput: string[] };
 type EndpointProbeResult = { domain: string; baseUrl: string; attempts: number; successCount: number; packetLoss: number; averageLatencyMs?: number | null; bestLatencyMs?: number | null; selected: boolean; error?: string | null };
 type EndpointProbeSummary = { selectedBaseUrl: string; selectedDomain: string; results: EndpointProbeResult[] };
 type UpdateCheckResult = { currentVersion: string; latestVersion?: string | null; updateAvailable: boolean; releaseUrl?: string | null; downloadUrl?: string | null; downloadAccelerated?: boolean; mainlandChina?: boolean; repository: string; error?: string | null };
@@ -30,7 +33,7 @@ type ConfigProfile = { id: string; createdAt: number; updatedAt: number; name: s
 type ConfigProfileInput = { name: string; tool: string; baseUrl: string; keyId?: number | null; apiKey?: string | null; model?: string | null; reviewModel?: string | null; localRoutingEnabled: boolean; localRouteApps: string[]; localRouteModelMap: Record<string, string>; localRoutePreserveClaudeAuth: boolean; localRouteOnly: boolean };
 type OnboardingMode = "official" | "ai8888";
 type AppPreferences = { onboardingCompleted: boolean; onboardingStep: number; onboardingMode?: OnboardingMode | null; dismissedAlertIds: string[] };
-type MainView = "connections" | "switch" | "workspace" | "usage" | "settings";
+type MainView = "home" | "connections" | "switch" | "workspace" | "usage" | "settings";
 type CodexSessionMeta = { sessionId: string; title?: string | null; summary?: string | null; projectDir?: string | null; createdAt?: string | null; lastActiveAt?: string | null; modelProvider?: string | null; modelProviderKey?: string | null; sourcePath: string; resumeCommand: string; archived: boolean; modifiedAt: number };
 type CodexSessionSearchHit = { session: CodexSessionMeta; matchedIn: string[]; snippet?: string | null };
 type CodexSessionMessage = { role: string; content: string; timestamp?: string | null };
@@ -40,7 +43,8 @@ type UnifiedSessionMessage = { role: string; content: string; timestamp?: string
 
 const defaultState: AppStateData = { account: null, subscriptions: [], subscriptionProgress: [], groups: [], keys: { items: [], total: 0 }, selectedTool: "codex", selectedKeyId: null, loginWindowOpen: false };
 const mainViews: Array<{ id: MainView; label: string; description: string }> = [
-  { id: "connections", label: "账户与连接", description: "OpenAI 官方账户、AI8888、订阅与 API Key" },
+  { id: "home", label: "首页", description: "Codex 是否就绪、当前来源和下一步" },
+  { id: "connections", label: "账户与连接", description: "OpenAI 官方账户、AI8888 与订阅" },
   { id: "switch", label: "配置切换", description: "连接方案、模型和本地路由" },
   { id: "workspace", label: "工作区", description: "项目、MCP、Prompts 与 Skills" },
   { id: "usage", label: "用量", description: "本地请求、Token 和成本" },
@@ -111,12 +115,9 @@ function isReloginError(text: string) {
     || value.includes("请重新登录")
     || value.includes("not logged in")
     || value.includes("missing refresh token")
-    || value.includes("unauthorized")
-    || value.includes("unauthenticated")
-    || value.includes("invalid token")
-    || value.includes("token expired")
-    || value.includes("401")
-    || value.includes("403");
+    || value.includes("invalid refresh token")
+    || value.includes("refresh token rejected")
+    || value.includes("refresh token expired");
 }
 
 function formatAuthError(err: unknown) {
@@ -417,6 +418,7 @@ function CodexSessionsApp() {
   const wizardModelRequestRef = useRef(false);
   const [wizardModeDraft, setWizardModeDraft] = useState<OnboardingMode>("official");
   const wizardAutoAdvanceRef = useRef(false);
+  const [wizardAutoAdvancePaused, setWizardAutoAdvancePaused] = useState(false);
   const [routeCodexEnabled, setRouteCodexEnabled] = useState(false);
   const [routeClaudeEnabled, setRouteClaudeEnabled] = useState(false);
   const [routeOpenCodeEnabled, setRouteOpenCodeEnabled] = useState(false);
@@ -425,12 +427,14 @@ function CodexSessionsApp() {
   const [localRouteOnly, setLocalRouteOnly] = useState(false);
   const [localRouteManifest, setLocalRouteManifest] = useState<LocalRouteManifest | null>(null);
   const [localRouteStatuses, setLocalRouteStatuses] = useState<LocalRouteStatus[]>([]);
+  const [localProxyStatus, setLocalProxyStatus] = useState<LocalProxyRuntimeStatus | null>(null);
+  const [localProxyHealth, setLocalProxyHealth] = useState<LocalProxyEndpointHealth[] | null>(null);
   const [activeView, setActiveView] = useState<MainView>(() => {
     try {
       const saved = window.localStorage.getItem("ai8888-switch.active-view");
-      return mainViews.some((item) => item.id === saved) ? saved as MainView : "connections";
+      return mainViews.some((item) => item.id === saved) ? saved as MainView : "home";
     } catch {
-      return "connections";
+      return "home";
     }
   });
   const codexAuth = useCodexAuth({
@@ -444,18 +448,17 @@ function CodexSessionsApp() {
   const selectedKey = useMemo(() => state.selectedKeyId == null ? null : (state.keys.items.find((key) => key.id === state.selectedKeyId) ?? null), [state.keys.items, state.selectedKeyId]);
   const selectedProfile = useMemo(() => profiles.find((profile) => profile.id === selectedProfileId) ?? null, [profiles, selectedProfileId]);
   const isAuthenticated = Boolean(state.session);
-  const accountAlerts = useMemo(() => {
-    if (!isAuthenticated) return [];
-    const all = buildAccountAlerts({ balance: state.account?.balance, subscriptions: state.subscriptions, subscriptionProgress: state.subscriptionProgress });
-    const dismissed = new Set(preferences.dismissedAlertIds || []);
-    return all.filter((alert) => !dismissed.has(alert.id));
-  }, [isAuthenticated, state.account?.balance, state.subscriptions, state.subscriptionProgress, preferences.dismissedAlertIds]);
-
   const onboardingMode: OnboardingMode = preferences.onboardingMode === "ai8888" || preferences.onboardingMode === "official"
     ? preferences.onboardingMode
     : preferences.onboardingStep > 0 && isAuthenticated ? "ai8888" : "official";
   const onboardingStep = Math.min(3, Math.max(0, preferences.onboardingStep || 0));
   const resolvedSubscriptions = useMemo(() => subscriptionsWithResolvedGroups(state.subscriptions, state.groups, state.subscriptionProgress), [state.subscriptions, state.groups, state.subscriptionProgress]);
+  const accountAlerts = useMemo(() => {
+    if (!isAuthenticated) return [];
+    const all = buildAccountAlerts({ balance: state.account?.balance, subscriptions: resolvedSubscriptions, subscriptionProgress: state.subscriptionProgress });
+    const dismissed = new Set(preferences.dismissedAlertIds || []);
+    return all.filter((alert) => !dismissed.has(alert.id));
+  }, [isAuthenticated, state.account?.balance, resolvedSubscriptions, state.subscriptionProgress, preferences.dismissedAlertIds]);
   const subscriptionGroupIds = useMemo(() => new Set(activeSubscriptionGroupIds(resolvedSubscriptions, "codex")), [resolvedSubscriptions]);
   const wizardKeys = useMemo(() => codexKeyCandidates(state.keys.items, state.groups), [state.keys.items, state.groups]);
   const recommendedSubscriptionGroup = recommendedSubscriptionGroupId(resolvedSubscriptions, "codex");
@@ -483,11 +486,55 @@ function CodexSessionsApp() {
   const wizardDisplayMode: OnboardingMode = onboardingStep === 0 ? wizardModeDraft : onboardingMode;
   const modelChoice = selectedModel.trim();
   const reviewModelChoice = selectedReviewModel.trim();
-  const canWrite = onboardingMode === "official"
-    ? Boolean(codexAuth.status?.authenticated)
-    : showWizard
-      ? Boolean(state.session && ai8888DataReady && wizardSelectedKey && wizardFundingSource === expectedWizardFundingSource && baseUrl.trim())
-      : Boolean(state.session && effectiveKey && baseUrl.trim());
+  const canWrite = showWizard
+    ? onboardingMode === "official"
+      ? Boolean(codexAuth.status?.authenticated)
+      : Boolean(state.session && ai8888DataReady && wizardSelectedKey && wizardFundingSource === expectedWizardFundingSource && baseUrl.trim())
+    : Boolean((state.session || codexAuth.status?.authenticated) && effectiveKey && baseUrl.trim());
+  const codexStatus = codexAuth.status as CodexAuthStatus | null;
+  const activeCodexProvider = codexStatus?.activeProvider || "custom";
+  const configuredCodexKey = useMemo(
+    () => codexStatus?.configuredKeyId == null ? null : state.keys.items.find((item) => item.id === codexStatus.configuredKeyId) ?? null,
+    [codexStatus?.configuredKeyId, state.keys.items],
+  );
+  const configuredCodexGroupId = keyGroupId(configuredCodexKey);
+  const activeCodexSubscription = useMemo(() => {
+    if (activeCodexProvider !== "ai8888" || configuredCodexGroupId == null) return null;
+    const activeIds = new Set(activeSubscriptionGroupIds(resolvedSubscriptions, "codex"));
+    return resolvedSubscriptions.find((subscription) => {
+      const groupId = subscription.group?.id ?? subscription.groupId ?? -1;
+      return activeIds.has(groupId) && configuredCodexGroupId === groupId;
+    }) ?? null;
+  }, [activeCodexProvider, configuredCodexGroupId, resolvedSubscriptions]);
+  const codexUsesLocalProxy = Boolean(localRouteManifest?.entries.some((entry) => entry.enabled && entry.app === "codex"));
+  const healthyProxyEndpoint = localProxyHealth?.some((endpoint) => endpoint.healthy) ?? false;
+  const codexConnectionReady = !codexUsesLocalProxy || Boolean(localProxyStatus?.ready && healthyProxyEndpoint);
+  const codexConfigValid = codexStatus?.configValid !== false && !codexStatus?.configError;
+  const codexReady = Boolean(
+    codexStatus?.cliAvailable
+      && codexConfigValid
+      && codexConnectionReady
+      && ((activeCodexProvider === "official" && codexStatus.authenticated)
+        || (activeCodexProvider === "ai8888" && isAuthenticated && codexStatus.ai8888ConfigAvailable)),
+  );
+  const activeCodexProviderLabel = activeCodexProvider === "official"
+    ? "OpenAI 官方账户"
+    : activeCodexProvider === "ai8888"
+      ? "AI8888"
+      : activeCodexProvider === "custom"
+        ? "自定义 Codex Provider"
+        : activeCodexProvider === "invalid"
+          ? "配置无法解析"
+          : "尚未配置";
+  const activeCodexFundingLabel = activeCodexProvider === "official"
+    ? "OpenAI 官方额度"
+    : activeCodexSubscription
+      ? `套餐「${activeCodexSubscription.group?.name || activeCodexSubscription.groupName || "当前套餐"}」`
+      : activeCodexProvider === "ai8888" && configuredCodexKey && !allCodexSubscriptionGroupIds(resolvedSubscriptions, state.groups).has(configuredCodexGroupId ?? -1) && Number(state.account?.balance ?? 0) > 0
+        ? `账户余额 ${money(state.account?.balance ?? 0)}`
+        : configuredCodexKey
+          ? `Key「${configuredCodexKey.name || "当前 Key"}」（来源无法确认）`
+        : "尚未确认";
   const localRoutingEnabled = routeCodexEnabled || routeClaudeEnabled || routeOpenCodeEnabled;
   const localRouteApps = useMemo(() => {
     const apps: string[] = [];
@@ -548,7 +595,24 @@ function CodexSessionsApp() {
   }
 
   async function refreshLocalState() { const next = await invoke<AppStateData>("app_get_state"); setState({ ...defaultState, ...next }); }
-  async function refreshLocalRouteManifest() { try { const [next, statuses] = await Promise.all([invoke<LocalRouteManifest>("app_get_local_route_manifest").catch(() => null), invoke<LocalRouteStatus[]>("app_get_local_route_statuses")]); setLocalRouteManifest(next); setLocalRouteStatuses(statuses); } catch { setLocalRouteManifest(null); setLocalRouteStatuses([]); } }
+  async function refreshLocalRouteManifest() {
+    try {
+      const [next, statuses, proxyStatus] = await Promise.all([
+        invoke<LocalRouteManifest>("app_get_local_route_manifest").catch(() => null),
+        invoke<LocalRouteStatus[]>("app_get_local_route_statuses"),
+        invoke<LocalProxyRuntimeStatus>("app_get_local_proxy_status").catch(() => null),
+      ]);
+      setLocalRouteManifest(next);
+      setLocalRouteStatuses(statuses);
+      setLocalProxyStatus(proxyStatus);
+      if (!next?.entries.some((entry) => entry.enabled) || !proxyStatus?.ready) setLocalProxyHealth(null);
+    } catch {
+      setLocalRouteManifest(null);
+      setLocalRouteStatuses([]);
+      setLocalProxyStatus(null);
+      setLocalProxyHealth(null);
+    }
+  }
   const refreshRemote = useCallback(async (options?: { silent?: boolean }) => {
     const silent = Boolean(options?.silent);
     try {
@@ -696,6 +760,17 @@ function CodexSessionsApp() {
   async function openDailyReset() { await run(() => invoke("app_open_daily_reset_window"), "已打开日卡重置页面"); }
   async function openRadar() { await run(() => invoke("app_open_radar_window"), "已打开智商雷达"); }
   async function openModelStatus() { await run(() => invoke("app_open_model_status_window"), "已打开模型监控"); }
+  async function restartLocalProxy() {
+    const status = await run(() => invoke<LocalProxyRuntimeStatus>("app_restart_local_proxy"), "本地路由已恢复");
+    if (status) {
+      setLocalProxyStatus(status);
+      try {
+        setLocalProxyHealth(await invoke<LocalProxyEndpointHealth[]>("app_probe_proxy_endpoints"));
+      } catch {
+        setLocalProxyHealth([]);
+      }
+    }
+  }
 
   async function openCodexSessions() { await run(() => invoke("app_open_codex_sessions_window"), "\u5df2\u6253\u5f00 Codex \u4f1a\u8bdd\u7ba1\u7406"); }
 
@@ -840,6 +915,7 @@ function CodexSessionsApp() {
       const next = await invoke<AppPreferences>("app_complete_onboarding");
       setPreferences(next);
       setShowWizard(false);
+      setActiveView("home");
       setMessage("首次设置已完成，配置已经可以使用");
       return true;
     } catch (err) {
@@ -873,8 +949,19 @@ function CodexSessionsApp() {
   }
 
   async function goBackOnboarding() {
-    if (!(await stopWizardOfficialLogin())) return;
-    await saveOnboardingStep(onboardingStep - 1);
+    // An already-authenticated official account would otherwise satisfy the
+    // step-1 auto-advance effect immediately and bounce the user forward.
+    setWizardAutoAdvancePaused(true);
+    wizardAutoAdvanceRef.current = true;
+    if (!(await stopWizardOfficialLogin())) {
+      setWizardAutoAdvancePaused(false);
+      wizardAutoAdvanceRef.current = false;
+      return;
+    }
+    if (!(await saveOnboardingStep(onboardingStep - 1))) {
+      setWizardAutoAdvancePaused(false);
+      wizardAutoAdvanceRef.current = false;
+    }
   }
 
   async function deferOnboarding() {
@@ -895,18 +982,22 @@ function CodexSessionsApp() {
     if (!(await stopWizardOfficialLogin())) return;
     setWizardSaving(true); setError(null);
     try {
-      if (await persistOnboardingStep(0, null)) {
-        setWizardModeDraft("official");
+      const detectedMode: OnboardingMode = codexStatus?.activeProvider === "ai8888" || isAuthenticated ? "ai8888" : "official";
+      if (await persistOnboardingStep(0, detectedMode)) {
+        setWizardAutoAdvancePaused(false);
+        setWizardModeDraft(detectedMode);
         setWizardModelAttempted(false); wizardModelRequestRef.current = false;
         setShowWizard(true); setActiveView("switch");
+        setMessage("已按当前账户重新打开一键设置");
       }
     } finally {
       setWizardSaving(false);
     }
   }
 
-  async function advanceOnboarding() {
+  async function advanceOnboarding(manual = false) {
     if (wizardSaving) return;
+    if (manual) setWizardAutoAdvancePaused(false);
     setWizardSaving(true); setError(null);
     try {
       if (onboardingStep === 0) {
@@ -1176,6 +1267,7 @@ function CodexSessionsApp() {
       if (result) {
         setPreview(result.artifacts);
         await loadProfileIntoForm(profile, false);
+        await codexAuth.refresh(true);
         setMessage(result.message);
       }
       await refreshConfigSnapshots();
@@ -1200,6 +1292,7 @@ function CodexSessionsApp() {
       const result = await run(() => invoke<ConfigTransactionResult>("app_restore_config_snapshot", { snapshotId }), "已恢复配置版本");
       if (result) {
         setPreview(result.artifacts);
+        await codexAuth.refresh(true);
         setMessage(result.message);
       }
       await refreshConfigSnapshots();
@@ -1215,26 +1308,27 @@ function CodexSessionsApp() {
       const target = await run(prepareTarget, "已生成写入目标");
       const result = await run(() => invoke<ConfigTransactionResult>("app_write_switch", { target }), localRoutingEnabled ? "已写入配置并启动本地路由" : "已写入配置");
       setPreview(result.artifacts); setMessage(result.message);
-      await refreshConfigSnapshots(); await refreshLocalRouteManifest();
+      await refreshConfigSnapshots(); await refreshLocalRouteManifest(); await codexAuth.refresh(true);
       return true;
     } catch {
       return false;
     }
   }
   async function copyKey() { if (!effectiveKey) return; await navigator.clipboard.writeText(effectiveKey); setMessage("API Key 已复制"); }
-  async function cleanupLocalRoute() { if (!window.confirm("确认清理本地路由接管？相关工具会恢复为清理后的配置。")) return; const result = await run(() => invoke<ConfigTransactionResult>("app_cleanup_local_route_takeover"), "已清理本地接管"); if (result) { setPreview(result.artifacts); setMessage(result.message); } await refreshConfigSnapshots(); await refreshLocalRouteManifest(); }
-  async function restoreLocalRouteBackups() { if (!window.confirm("确认用旧版备份覆盖当前工具配置？")) return; const result = await run(() => invoke<ConfigTransactionResult>("app_restore_local_route_backups"), "已从备份恢复配置"); if (result) { setPreview(result.artifacts); setMessage(result.message); } await refreshConfigSnapshots(); await refreshLocalRouteManifest(); }
+  async function cleanupLocalRoute() { if (!window.confirm("确认清理本地路由接管？相关工具会恢复为清理后的配置。")) return; const result = await run(() => invoke<ConfigTransactionResult>("app_cleanup_local_route_takeover"), "已清理本地接管"); if (result) { setPreview(result.artifacts); setMessage(result.message); } await refreshConfigSnapshots(); await refreshLocalRouteManifest(); await codexAuth.refresh(true); }
+  async function restoreLocalRouteBackups() { if (!window.confirm("确认用旧版备份覆盖当前工具配置？")) return; const result = await run(() => invoke<ConfigTransactionResult>("app_restore_local_route_backups"), "已从备份恢复配置"); if (result) { setPreview(result.artifacts); setMessage(result.message); } await refreshConfigSnapshots(); await refreshLocalRouteManifest(); await codexAuth.refresh(true); }
   function updateLocalRouteModel(role: string, value: string) { setLocalRouteModelMap((current) => ({ ...current, [role]: value })); }
   function fillLocalRouteModels() { if (!modelChoice) return; setLocalRouteModelMap({ sonnet: modelChoice, opus: modelChoice, haiku: modelChoice }); }
 
   useEffect(() => { void (async () => {
     try {
-      const [nextState, nextTools, nextEndpoint, nextManifest, nextStatuses, nextPrefs, nextSnapshots, nextProfiles] = await Promise.all([
+      const [nextState, nextTools, nextEndpoint, nextManifest, nextStatuses, nextProxyStatus, nextPrefs, nextSnapshots, nextProfiles] = await Promise.all([
         invoke<AppStateData>("app_get_state"),
         invoke<ToolProfile[]>("app_get_tools"),
         invoke<EndpointProbeSummary>("app_get_endpoint").catch(() => null),
         invoke<LocalRouteManifest>("app_get_local_route_manifest").catch(() => null),
         invoke<LocalRouteStatus[]>("app_get_local_route_statuses").catch(() => []),
+        invoke<LocalProxyRuntimeStatus>("app_get_local_proxy_status").catch(() => null),
         invoke<AppPreferences>("app_get_preferences").catch(() => ({ onboardingCompleted: false, onboardingStep: 0, onboardingMode: null, dismissedAlertIds: [] })),
         invoke<ConfigSnapshotSummary[]>("app_list_config_snapshots").catch(() => []),
         invoke<ConfigProfile[]>("app_list_config_profiles").catch(() => []),
@@ -1258,6 +1352,7 @@ function CodexSessionsApp() {
       }
       setLocalRouteManifest(nextManifest);
       setLocalRouteStatuses(nextStatuses);
+      setLocalProxyStatus(nextProxyStatus);
 
       if (nextState.session) {
         try {
@@ -1304,18 +1399,53 @@ function CodexSessionsApp() {
       return;
     }
     if (wizardSaving || busy || codexAuth.busy || error || modelError) return;
+    if (wizardAutoAdvancePaused) return;
     const officialReady = onboardingMode === "official" && Boolean(codexAuth.status?.authenticated) && !codexAuth.status?.loginRunning;
     const aiReady = onboardingMode === "ai8888" && isAuthenticated && ai8888DataReady && hasAi8888Funding;
     if (!officialReady && !aiReady) return;
     if (wizardAutoAdvanceRef.current) return;
     wizardAutoAdvanceRef.current = true;
     void advanceOnboarding();
-  }, [showWizard, onboardingStep, onboardingMode, wizardSaving, busy, codexAuth.busy, codexAuth.status?.authenticated, codexAuth.status?.loginRunning, isAuthenticated, ai8888DataReady, hasAi8888Funding, error, modelError]);
+  }, [showWizard, onboardingStep, onboardingMode, wizardSaving, wizardAutoAdvancePaused, busy, codexAuth.busy, codexAuth.status?.authenticated, codexAuth.status?.loginRunning, isAuthenticated, ai8888DataReady, hasAi8888Funding, error, modelError]);
   useEffect(() => {
     if (!showWizard || activeView !== "switch" || onboardingMode !== "ai8888" || !isAuthenticated || onboardingStep !== 2 || wizardModelAttempted || wizardModelRequestRef.current || testingModels || !effectiveKey || !baseUrl.trim()) return;
     wizardModelRequestRef.current = true;
     void testModels();
   }, [showWizard, activeView, onboardingMode, isAuthenticated, onboardingStep, wizardModelAttempted, testingModels, effectiveKey, baseUrl]);
+  useEffect(() => {
+    if (!localRouteManifest?.entries.some((entry) => entry.enabled)) return;
+    const refreshProxyStatus = async () => {
+      try {
+        setLocalProxyStatus(await invoke<LocalProxyRuntimeStatus>("app_get_local_proxy_status"));
+      } catch {
+        setLocalProxyStatus(null);
+      }
+    };
+    void refreshProxyStatus();
+    const timer = window.setInterval(() => { void refreshProxyStatus(); }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [localRouteManifest]);
+  useEffect(() => {
+    if (!localRouteManifest?.entries.some((entry) => entry.enabled) || !localProxyStatus?.ready) {
+      setLocalProxyHealth(null);
+      return;
+    }
+    let disposed = false;
+    const refreshProxyHealth = async () => {
+      try {
+        const health = await invoke<LocalProxyEndpointHealth[]>("app_probe_proxy_endpoints");
+        if (!disposed) setLocalProxyHealth(health);
+      } catch {
+        if (!disposed) setLocalProxyHealth([]);
+      }
+    };
+    void refreshProxyHealth();
+    const timer = window.setInterval(() => { void refreshProxyHealth(); }, 30_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [localRouteManifest, localProxyStatus?.ready, localProxyStatus?.generation]);
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: "auto" });
     try { window.localStorage.setItem("ai8888-switch.active-view", activeView); } catch { /* Storage is optional. */ }
@@ -1330,19 +1460,45 @@ function CodexSessionsApp() {
           <button type="button" onClick={() => void openCodexSessions()} disabled={showWizard}><strong>会话管理</strong><small>浏览并恢复跨工具会话</small></button>
         </nav>
         <div className="sidebarAccount">
-          <div className="accountState"><span className={`dot ${isAuthenticated ? "ok" : ""}`} /><div><strong>{isAuthenticated ? state.account?.username || state.account?.email || "AI8888 已登录" : "AI8888 未登录"}</strong><small>{isAuthenticated ? `余额 ${money(state.account?.balance ?? 0)}` : "OpenAI 用户仍可使用本地功能"}</small></div></div>
-          <div className="sidebarActions"><button className="ghost mini" onClick={openPurchase} disabled={showWizard}>充值续费</button>{isAuthenticated && <button className="ghost mini" onClick={() => void logout()} disabled={busy}>退出</button>}</div>
+          <div className="accountState"><span className={`dot ${codexReady ? "ok" : ""}`} /><div><strong>{activeCodexProviderLabel}</strong><small>{codexReady ? activeCodexFundingLabel : "Codex 尚未就绪"}</small></div></div>
+          <div className="sidebarActions"><button className="ghost mini" onClick={() => setActiveView("connections")} disabled={showWizard}>切换账户</button>{isAuthenticated && <button className="ghost mini" onClick={openPurchase} disabled={showWizard}>充值续费</button>}</div>
         </div>
       </aside>
 
       <div className="appContent">
         <header className="pageHeader">
           <div><p className="eyebrow">AI8888 Switch</p><h1>{activeViewMeta.label}</h1><p>{activeViewMeta.description}</p></div>
-          <div className="pageStatus"><span className={`dot ${error || modelError ? "" : "ok"}`} /><div><strong>{busy ? "处理中" : message}</strong><small>{selectedProfile?.name ? `当前方案：${selectedProfile.name}` : selectedTool?.displayName || "本地工作台"}</small></div></div>
+          <div className="pageStatus"><span className={`dot ${!error && !modelError && codexReady ? "ok" : ""}`} /><div><strong>{busy ? "处理中" : message}</strong><small>{codexReady ? `${activeCodexProviderLabel} · ${activeCodexFundingLabel}` : "Codex 尚未就绪"}</small></div></div>
         </header>
         {error && <div className="alert">{error}</div>}{!showWizard && modelError && <div className="alert">{modelError}</div>}
 
       {!showWizard && activeView === "connections" && isAuthenticated && accountAlerts.length > 0 && <section className="alertStack">{accountAlerts.slice(0, 4).map((alert) => <article className={"alertCard " + alert.level} key={alert.id}><div><strong>{alert.title}</strong><p>{alert.detail}</p></div><div className="alertActions">{alert.action === "purchase" && <button className="secondary mini" onClick={() => void openPurchase()}>{"\u5145\u503c\u7eed\u8d39"}</button>}{alert.action === "refresh" && <button className="ghost mini" onClick={() => { void refreshRemote(); }} disabled={busy}>{"\u5237\u65b0\u7528\u91cf"}</button>}<button className="ghost mini" onClick={() => void dismissAlert(alert.id)}>{"\u5ffd\u7565"}</button></div></article>)}</section>}
+
+      {!showWizard && activeView === "home" && <section className="homeView">
+        <section className={`panel readinessPanel ${codexReady ? "ready" : "needsAction"}`}>
+          <div className="panelHead">
+            <div><p className="eyebrow">Codex</p><h2>{codexReady ? "Codex 已就绪" : "还需要处理一项设置"}</h2><p className="muted">这里显示 Codex 当前真正使用的账户、额度和本机状态。</p></div>
+            <span className={`badge ${codexReady ? "officialBadge" : ""}`}>{codexReady ? "可用" : "待处理"}</span>
+          </div>
+          <div className="readinessGrid">
+            <div><span>当前账户</span><strong>{activeCodexProviderLabel}</strong></div>
+            <div><span>使用来源</span><strong>{activeCodexFundingLabel}</strong></div>
+            <div><span>CLI</span><strong>{codexStatus?.cliAvailable ? (codexStatus.cliVersion || "已安装") : "未找到"}</strong></div>
+            <div><span>模型</span><strong>{codexStatus?.configuredModel || "Codex 默认模型"}{codexStatus?.configuredReviewModel ? ` · 审核 ${codexStatus.configuredReviewModel}` : ""}</strong></div>
+            <div><span>配置</span><strong>{!codexConfigValid ? "解析失败" : !codexStatus?.configExists ? "Codex 默认配置" : activeCodexProvider === "official" || activeCodexProvider === "ai8888" ? `已识别${codexStatus.configuredBaseUrl ? ` · ${codexStatus.configuredBaseUrl}` : ""}` : "待配置"}</strong></div>
+            <div><span>连接</span><strong>{codexUsesLocalProxy ? !localProxyStatus?.ready ? "本地监听未就绪" : localProxyHealth == null ? "正在检查上游" : healthyProxyEndpoint ? "本地路由正常" : "代理上游不可用" : "直连"}</strong></div>
+          </div>
+          {!codexReady && <p className="inlineAlert">{!codexStatus?.cliAvailable ? "未找到 Codex CLI，请先检测或安装。" : !codexConfigValid ? (codexStatus?.configError || "Codex config.toml 无法解析；为保护原文件，应用不会覆盖它。") : codexUsesLocalProxy && !localProxyStatus?.ready ? (localProxyStatus?.lastError || "本地路由未能启动，请重新启动。") : codexUsesLocalProxy && localProxyHealth != null && !healthyProxyEndpoint ? (localProxyHealth.find((endpoint) => !endpoint.healthy)?.error || "本地路由已启动，但上游当前不可用。") : activeCodexProvider === "ai8888" && !codexStatus.ai8888ConfigAvailable ? "AI8888 配置不完整，请重新应用配置。" : activeCodexProvider === "ai8888" && !isAuthenticated ? "AI8888 登录已失效，请重新登录。" : activeCodexProvider === "official" && !codexStatus.authenticated ? "OpenAI 官方账户尚未登录。" : "尚未完成 Codex 配置。"}</p>}
+          <div className="actions primaryActions">
+            <button onClick={() => setActiveView("connections")}>{codexReady ? "切换账户" : "连接账户"}</button>
+            <button className="secondary" onClick={() => setActiveView("switch")}>配置与修复</button>
+            {codexUsesLocalProxy && (!localProxyStatus?.ready || !healthyProxyEndpoint) && <button className="secondary" onClick={() => void restartLocalProxy()} disabled={busy}>重新启动本地路由</button>}
+            <button className="ghost" onClick={() => void restartOnboarding()} disabled={wizardSaving || busy}>重新运行一键设置</button>
+            <button className="ghost" onClick={() => void openCodexSessions()}>打开会话</button>
+          </div>
+        </section>
+        {isAuthenticated && accountAlerts.length > 0 && <section className="alertStack">{accountAlerts.slice(0, 3).map((alert) => <article className={"alertCard " + alert.level} key={alert.id}><div><strong>{alert.title}</strong><p>{alert.detail}</p></div><div className="alertActions">{alert.action === "purchase" && <button className="secondary mini" onClick={() => void openPurchase()}>充值续费</button>}{alert.action === "refresh" && <button className="ghost mini" onClick={() => { void refreshRemote(); }} disabled={busy}>刷新用量</button>}</div></article>)}</section>}
+      </section>}
 
       {activeView === "switch" && showWizard && (
         <section className="panel wizardPanel">
@@ -1398,7 +1554,7 @@ function CodexSessionsApp() {
                   <p className="muted">账户和可用额度已经检查完成，不需要挑选 Key 或线路。</p>
                   <div className="wizardSummary"><div><span>使用来源</span><strong>{wizardFundingSource === "subscription" ? `套餐「${wizardSubscriptionName}」` : wizardFundingSource === "balance" ? `账户余额 ${money(state.account?.balance ?? 0)}` : "待重新准备"}</strong></div><div><span>连接状态</span><strong>{wizardSelectedKey ? "已自动准备" : "待重新准备"}</strong></div></div>
                   {testingModels && <div className="wizardLoading"><span className="dot ok" /><strong>正在读取可用模型…</strong></div>}
-                  {!testingModels && models.length > 0 && <label className="wizardModelSelect">主模型（一般无需修改）<select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.id}>{model.id}{model.ownedBy ? ` - ${model.ownedBy}` : ""}</option>)}</select></label>}
+                  {!testingModels && models.length > 0 && <label className="wizardModelSelect">主模型<select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.id}>{model.id}{model.ownedBy ? ` - ${model.ownedBy}` : ""}</option>)}</select></label>}
                   {!testingModels && wizardModelAttempted && models.length === 0 && !modelError && <div className="wizardLoading"><span className="dot ok" /><div><strong>使用默认模型</strong><small>服务端没有返回模型列表，仍可继续。</small></div></div>}
                   {modelError && <div className="wizardRetry"><span>连接验证失败，请重试后再继续。</span><button className="ghost mini" onClick={retryWizardModels}>重试</button></div>}
                 </>}
@@ -1419,7 +1575,7 @@ function CodexSessionsApp() {
           </div>
           <div className="wizardActions">
             <div>{onboardingStep > 0 && <button className="ghost" onClick={() => void goBackOnboarding()} disabled={wizardSaving || busy || codexAuth.busy || probingEndpoint || testingModels}>上一步</button>}</div>
-            {onboardingStep < 3 ? <button onClick={() => void advanceOnboarding()} disabled={wizardSaving || busy || codexAuth.busy || probingEndpoint || testingModels || (onboardingStep === 1 && (onboardingMode === "official" ? !codexAuth.status?.authenticated : !isAuthenticated || !ai8888DataReady || !hasAi8888Funding))}>{wizardSaving || probingEndpoint || testingModels ? "自动检查中…" : onboardingStep === 0 ? "选择并继续" : onboardingStep === 1 ? (onboardingMode === "official" ? "已登录，继续" : "自动检查并继续") : "确认这些设置"}</button> : <button onClick={() => void finishOnboarding()} disabled={wizardSaving || busy || codexAuth.busy || !canWrite}>{wizardSaving || busy || codexAuth.busy ? "正在应用…" : "确认并开始使用 Codex"}</button>}
+            {onboardingStep < 3 ? <button onClick={() => void advanceOnboarding(true)} disabled={wizardSaving || busy || codexAuth.busy || probingEndpoint || testingModels || (onboardingStep === 1 && (onboardingMode === "official" ? !codexAuth.status?.authenticated : !isAuthenticated || !ai8888DataReady || !hasAi8888Funding))}>{wizardSaving || probingEndpoint || testingModels ? "自动检查中…" : onboardingStep === 0 ? "选择并继续" : onboardingStep === 1 ? (onboardingMode === "official" ? "已登录，继续" : "自动检查并继续") : "确认这些设置"}</button> : <button onClick={() => void finishOnboarding()} disabled={wizardSaving || busy || codexAuth.busy || !canWrite}>{wizardSaving || busy || codexAuth.busy ? "正在应用…" : "确认并开始使用 Codex"}</button>}
           </div>
         </section>
       )}
@@ -1431,7 +1587,7 @@ function CodexSessionsApp() {
       <div className="utilityBar"><span>账户服务</span><div className="actions"><button className="ghost" onClick={openModelStatus}>模型监控</button><button className="ghost" onClick={openRadar}>智商雷达</button><button className="ghost" onClick={() => void openCodexSessions()}>会话管理</button></div></div>
 
       {isAuthenticated && <section className="grid two accountGrid">
-        <div className="panel"><div className="panelHead"><h2>订阅</h2><div className="actions"><button className="secondary mini" onClick={() => void openDailyReset()}>日卡重置</button><span className="badge">可用 {state.subscriptions.filter(isActiveSubscription).length} / 总计 {state.subscriptions.length}</span></div></div><div className="list">{state.subscriptions.length === 0 && <p className="muted">暂无订阅</p>}{state.subscriptions.map((sub) => { const progress = subscriptionProgressInfo(sub, state.subscriptionProgress); const daily = usageWindow(sub, progress, "daily"); const weekly = usageWindow(sub, progress, "weekly"); const monthly = usageWindow(sub, progress, "monthly"); return <article className="row subscriptionRow" key={sub.id}><div><strong>{progress?.groupName || sub.groupName || sub.group?.name || `订阅 #${sub.id}`}</strong><small>{sub.status} - 到期 {safeDate(progress?.expiresAt ?? sub.expiresAt)}</small><small>{quotaLine(sub, progress)}</small><div className="usageGrid"><span>日：已用 {moneyOrDash(daily.used)} / 限额 {moneyOrDash(daily.limit)} / 剩余 {moneyOrDash(daily.remaining)} / {percentLabel(daily.used, daily.limit, daily.percentage)}</span><span>周：已用 {moneyOrDash(weekly.used)} / 限额 {moneyOrDash(weekly.limit)} / 剩余 {moneyOrDash(weekly.remaining)} / {percentLabel(weekly.used, weekly.limit, weekly.percentage)}</span><span>月：已用 {moneyOrDash(monthly.used)} / 限额 {moneyOrDash(monthly.limit)} / 剩余 {moneyOrDash(monthly.remaining)} / {percentLabel(monthly.used, monthly.limit, monthly.percentage)}</span></div></div><span>{isActiveSubscription(sub) ? "有效" : "无效"}</span></article>; })}</div></div>
+        <div className="panel"><div className="panelHead"><h2>订阅</h2><div className="actions"><button className="secondary mini" onClick={() => void openDailyReset()}>日卡重置</button><span className="badge">可用 {resolvedSubscriptions.filter(isActiveSubscription).length} / 总计 {resolvedSubscriptions.length}</span></div></div><div className="list">{resolvedSubscriptions.length === 0 && <p className="muted">暂无订阅</p>}{resolvedSubscriptions.map((sub) => { const progress = subscriptionProgressInfo(sub, state.subscriptionProgress); const daily = usageWindow(sub, progress, "daily"); const weekly = usageWindow(sub, progress, "weekly"); const monthly = usageWindow(sub, progress, "monthly"); return <article className="row subscriptionRow" key={sub.id}><div><strong>{progress?.groupName || sub.groupName || sub.group?.name || `订阅 #${sub.id}`}</strong><small>{sub.status} - 到期 {safeDate(progress?.expiresAt ?? sub.expiresAt)}</small><small>{quotaLine(sub, progress)}</small><div className="usageGrid"><span>日：已用 {moneyOrDash(daily.used)} / 限额 {moneyOrDash(daily.limit)} / 剩余 {moneyOrDash(daily.remaining)} / {percentLabel(daily.used, daily.limit, daily.percentage)}</span><span>周：已用 {moneyOrDash(weekly.used)} / 限额 {moneyOrDash(weekly.limit)} / 剩余 {moneyOrDash(weekly.remaining)} / {percentLabel(weekly.used, weekly.limit, weekly.percentage)}</span><span>月：已用 {moneyOrDash(monthly.used)} / 限额 {moneyOrDash(monthly.limit)} / 剩余 {moneyOrDash(monthly.remaining)} / {percentLabel(monthly.used, monthly.limit, monthly.percentage)}</span></div></div><span>{isActiveSubscription(sub) ? "有效" : "无效"}</span></article>; })}</div></div>
         <div className="panel"><div className="panelHead"><h2>API Key</h2><span className="badge">{state.keys.total}</span></div><div className="inlineForm"><input value={newKeyName} onChange={(e) => setNewKeyName(e.target.value)} placeholder="Key 名称" /><select value={newKeyGroupId} onChange={(e) => setNewKeyGroupId(e.target.value)}><option value="">不绑定分组</option>{state.groups.map((group) => <option key={group.id} value={group.id}>{group.name}{group.platform ? ` - ${group.platform}` : ""}</option>)}</select><button onClick={() => void createKey()} disabled={busy || !newKeyName}>创建</button></div><div className="list keys">{state.keys.items.length === 0 && <p className="muted">暂无 Key。请先创建或同步 API Key。</p>}{state.keys.items.map((item) => { const resolvedGroup = keyGroup(item, state.groups); const groupValue = editKeyGroupId[item.id] ?? (keyGroupId(item)?.toString() ?? ""); return <article className={"row selectable " + (selectedKey?.id === item.id ? "selected" : "")} key={item.id} onClick={() => chooseKey(item.id)}><div><strong>{item.name || `Key #${item.id}`}</strong><small>{item.status || "unknown"} - {resolvedGroup?.name || "未分组"} - {maskKey(item.key)}</small></div><div className="actions"><select value={groupValue} onChange={(e) => { e.stopPropagation(); setEditKeyGroupId((cur) => ({ ...cur, [item.id]: e.target.value })); void updateKeyGroup(item.id, e.target.value); }} onClick={(e) => e.stopPropagation()}><option value="">不绑定分组</option>{state.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select><button className="danger mini" onClick={(e) => { e.stopPropagation(); void deleteKey(item.id); }}>删除</button></div></article>; })}</div></div>
       </section>}
       </>}
@@ -1485,7 +1641,7 @@ function CodexSessionsApp() {
               <label className="checkboxLine"><input type="checkbox" checked={routeCodexEnabled} onChange={(e) => setRouteCodexEnabled(e.target.checked)} /> 启用 Codex 本地路由</label>
               <label className="checkboxLine"><input type="checkbox" checked={routeClaudeEnabled} onChange={(e) => setRouteClaudeEnabled(e.target.checked)} /> 启用 Claude 本地路由</label>
               <label className="checkboxLine"><input type="checkbox" checked={routeOpenCodeEnabled} onChange={(e) => setRouteOpenCodeEnabled(e.target.checked)} /> 启用 OpenCode 本地路由</label>
-              {routeClaudeEnabled && <div className="routeBox"><div className="routeTitle">Claude 路由模型映射</div><div className="modelMapGrid"><label>Sonnet<input value={localRouteModelMap.sonnet} onChange={(e) => updateLocalRouteModel("sonnet", e.target.value)} /></label><label>Opus<input value={localRouteModelMap.opus} onChange={(e) => updateLocalRouteModel("opus", e.target.value)} /></label><label>Haiku<input value={localRouteModelMap.haiku} onChange={(e) => updateLocalRouteModel("haiku", e.target.value)} /></label></div><div className="actions"><button className="secondary" onClick={fillLocalRouteModels} disabled={!modelChoice}>用当前模型填充</button><label className="checkboxLine"><input type="checkbox" checked={localRoutePreserveClaudeAuth} onChange={(e) => setLocalRoutePreserveClaudeAuth(e.target.checked)} /> 保留 Claude 现有认证</label></div></div>}
+              {routeClaudeEnabled && <div className="routeBox"><div className="routeTitle">Claude 路由模型映射</div><div className="modelMapGrid"><label>Sonnet<input value={localRouteModelMap.sonnet} onChange={(e) => updateLocalRouteModel("sonnet", e.target.value)} /></label><label>Opus<input value={localRouteModelMap.opus} onChange={(e) => updateLocalRouteModel("opus", e.target.value)} /></label><label>Haiku<input value={localRouteModelMap.haiku} onChange={(e) => updateLocalRouteModel("haiku", e.target.value)} /></label></div><div className="actions"><button className="secondary" onClick={fillLocalRouteModels} disabled={!modelChoice}>用当前模型填充</button></div></div>}
               {localRoutingEnabled && <label className="checkboxLine"><input type="checkbox" checked={localRouteOnly} onChange={(e) => setLocalRouteOnly(e.target.checked)} /> 只接管路由，不写模型</label>}
               <div className="actions maintenanceActions"><button className="ghost" onClick={copyKey} disabled={!effectiveKey}>复制 Key</button><button className="danger" onClick={cleanupLocalRoute} disabled={busy}>清理本地路由</button><button className="danger" onClick={restoreLocalRouteBackups} disabled={busy}>恢复旧版备份</button></div>
             </div>
@@ -1504,12 +1660,12 @@ function CodexSessionsApp() {
       </section>
 
       {preview.length > 0 && <section className="panel"><div className="panelHead"><h2>写入目标</h2></div><div className="list">{preview.map(([path, label]) => <article className="row" key={path}><div><strong>{label}</strong><small>{path}</small></div></article>)}</div></section>}
-      {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
+      {localRouteManifest && localRouteManifest.entries.length > 0 && <section className="panel routeManifest"><div className="panelHead"><h2>本地路由状态</h2></div><div className={"routeEntry " + (localProxyStatus?.ready && healthyProxyEndpoint ? "okEntry" : "")}><strong>代理进程：{!localProxyStatus?.ready ? "未就绪" : localProxyHealth == null ? "正在检查上游" : healthyProxyEndpoint ? "监听与上游正常" : "上游不可用"}</strong><small>{localProxyStatus?.lastError || localProxyStatus?.address || "尚未启动"}</small>{(!localProxyStatus?.ready || !healthyProxyEndpoint) && <button className="secondary mini" onClick={() => void restartLocalProxy()} disabled={busy}>重新启动本地路由</button>}</div>{localRouteManifest.entries.map((entry) => <div className="routeEntry" key={entry.app}><strong>{appLabel(entry.app)} - {entry.localBaseUrl}</strong><small>模型：{entry.model || "默认"}</small></div>)}{localRouteStatuses.map((status) => <div className={"routeEntry " + (status.detected ? "okEntry" : "")} key={status.app}><strong>{appLabel(status.app)}：{status.detected ? "已接管" : "未接管"}</strong><small>{status.detail}</small></div>)}</section>}
       </>}
       {!showWizard && activeView === "settings" && <footer className="appFooter">
-        <div>v0.1.1 Copyright AI8888.SHOP 2026</div>
+        <div>v0.1.2 Copyright AI8888.SHOP 2026</div>
         <div className="footerActions">
-          <button className="ghost mini" onClick={() => { void restartOnboarding(); }} disabled={wizardSaving || busy}>重新运行首次设置</button>
+          <button className="ghost mini" onClick={() => { void restartOnboarding(); }} disabled={wizardSaving || busy}>重新运行一键设置</button>
           <button className="ghost mini" onClick={() => { void checkUpdate(); }} disabled={checkingUpdate || installingUpdate}>{checkingUpdate ? "检查中" : "检查更新"}</button>
           {updateInfo?.updateAvailable && updateInfo.downloadUrl && <button className="secondary mini" onClick={() => { void installUpdate(); }} disabled={checkingUpdate || installingUpdate}>{installingUpdate ? "正在下载安装" : "下载并安装"}</button>}
           {(updateInfo?.downloadUrl || updateInfo?.releaseUrl) && <a href={updateInfo.downloadUrl || updateInfo.releaseUrl || "#"} target="_blank" rel="noreferrer">{updateInfo.updateAvailable ? (updateInfo.downloadUrl ? (updateInfo.downloadAccelerated ? "加速下载链接" : "直接下载链接") : "查看新版本") : "GitHub Releases"}</a>}

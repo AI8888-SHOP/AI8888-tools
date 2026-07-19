@@ -15,28 +15,37 @@ mod workspace;
 
 use std::collections::HashMap;
 
-use api::{ApiClient, CreateKeyPayload, LoginPayload, ModelsQuery, RefreshPayload, UpdateKeyPayload};
+use api::{classify_api_error, ApiClient, ApiErrorKind, CreateKeyPayload, LoginPayload, ModelsQuery, RefreshPayload, UpdateKeyPayload};
 use backup::{app_export_config, app_import_config, app_repair_workspace, app_run_diagnostics};
 use codex_auth::{open_device_auth_page, CodexAuthManager, CodexAuthStatus};
 use codex_sessions::{CodexSessionMessage, CodexSessionMeta, CodexSessionSearchHit, CodexSessionSearchRequest, CodexSessionVisibilityRepairOutcome, CodexSessionVisibilityRepairRequest};
-use config::{ensure_app_dir, local_route_manifest_path, preferences_path, read_json, state_path, updates_dir, write_json, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL, REST_URL};
+use config::{ensure_app_dir, local_route_manifest_path, preferences_path, read_json, state_path, updates_dir, write_json, LOCAL_PROXY_BASE_URL, MODEL_STATUS_URL, PURCHASE_URL, RADAR_URL, REST_URL};
 use config_profiles::{delete_profile, list_profiles, resolve_profile_target, save_profile};
 use config_transaction::{create_snapshot, list_snapshots, prune_snapshots, remove_snapshot, restore_snapshot, rollback_failed_transaction};
 use error::AppError;
-use local_proxy::{app_probe_proxy_endpoints, ensure_local_proxy};
-use models::{AccountSummary, ApiKeySummary, AppPreferences, AppStateData, ConfigProfile, ConfigProfileInput, ConfigSnapshotSummary, ConfigTransactionResult, EndpointProbeSummary, GroupSummary, LocalRouteManifest, LocalRouteStatus, LoginResult, ModelSummary, Pagination, StoredSession, SubscriptionSummary, SwitchTarget, ToolProfile, UpdateCheckResult, UpdateDownloadProgress, UpdateInstallResult};
+use local_proxy::{app_get_local_proxy_status, app_probe_proxy_endpoints, app_restart_local_proxy, build_local_proxy_recovery_target, ensure_local_proxy, restore_local_proxy_from_state, stop_local_proxy};
+use models::{
+  AccountSummary, ApiKeySummary, AppPreferences, AppStateData, ConfigProfile, ConfigProfileInput, ConfigSnapshotSummary, ConfigTransactionResult, EndpointProbeSummary, GroupSummary, LocalRouteManifest, LocalRouteStatus, LoginResult,
+  ModelSummary, Pagination, StoredSession, SubscriptionSummary, SwitchTarget, ToolProfile, UpdateCheckResult, UpdateDownloadProgress, UpdateInstallResult,
+};
 use sha2::{Digest, Sha256};
 use tauri::menu::{Menu, MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{watch, Mutex, RwLock};
-use tools::{activate_codex_official, all_managed_config_paths, build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, managed_paths_for_route_cleanup, managed_paths_for_target, restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind};
+use tools::{
+  activate_codex_official, all_managed_config_paths, build_tool_preview, cleanup_local_route_takeover, default_switch_target, detect_local_route_statuses, managed_paths_for_route_cleanup, managed_paths_for_target,
+  restore_local_route_backups, supported_tools, write_local_routed_targets, ToolKind,
+};
 use unified_sessions::{app_get_unified_session_messages, app_list_unified_sessions};
 use usage::{app_clear_usage, app_get_usage_dashboard};
-use workspace::{app_apply_project, app_delete_mcp_server, app_delete_project, app_delete_prompt, app_delete_skill, app_get_workspace, app_import_mcp_from_app, app_install_skill, app_save_mcp_server, app_save_model_price, app_save_project, app_save_prompt, app_save_proxy_settings, app_sync_mcp_servers, app_update_skill_apps};
+use workspace::{
+  app_apply_project, app_delete_mcp_server, app_delete_project, app_delete_prompt, app_delete_skill, app_get_workspace, app_import_mcp_from_app, app_install_skill, app_save_mcp_server, app_save_model_price, app_save_project,
+  app_save_prompt, app_save_proxy_settings, app_sync_mcp_servers, app_update_skill_apps,
+};
 
-const CURRENT_APP_VERSION: &str = "v0.1.1";
+const CURRENT_APP_VERSION: &str = "v0.1.2";
 const GITHUB_UPDATE_REPOSITORY: &str = "AI8888-SHOP/AI8888-tools";
 const TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_ID: &str = "tray-show";
@@ -58,6 +67,7 @@ pub struct SharedState {
   codex_auth: CodexAuthManager,
   update_download: std::sync::Mutex<Option<UpdateDownloadControl>>,
   config_transaction: Mutex<()>,
+  session_refresh: Mutex<Option<SessionRefreshFlight>>,
 }
 
 impl SharedState {
@@ -71,6 +81,7 @@ impl SharedState {
       codex_auth: CodexAuthManager::new(),
       update_download: std::sync::Mutex::new(None),
       config_transaction: Mutex::new(()),
+      session_refresh: Mutex::new(None),
     })
   }
 }
@@ -84,6 +95,36 @@ fn load_state() -> Option<AppStateData> {
   read_json(&state_path()).ok()
 }
 
+fn startup_local_proxy_profile(manifest: &LocalRouteManifest) -> Option<ConfigProfile> {
+  let mut routed_apps = manifest.entries.iter().filter(|entry| entry.enabled).map(|entry| entry.app.clone()).collect::<Vec<_>>();
+  routed_apps.sort();
+  routed_apps.dedup();
+  let manifest_model = manifest.entries.iter().find_map(|entry| entry.model.as_deref()).map(str::trim).filter(|model| !model.is_empty());
+  let mut candidates = list_profiles()
+    .ok()?
+    .into_iter()
+    .filter(|profile| profile.local_routing_enabled)
+    .filter(|profile| {
+      let mut apps = profile.local_route_apps.clone();
+      apps.sort();
+      apps.dedup();
+      apps == routed_apps
+    })
+    .filter(|profile| manifest_model.map(|model| profile.model.as_deref() == Some(model)).unwrap_or(true))
+    .collect::<Vec<_>>();
+  if let Some(index) = candidates.iter().position(|profile| profile.name == manifest.profile_name) {
+    return Some(candidates.swap_remove(index));
+  }
+  if candidates.len() != 1 {
+    return None;
+  }
+  candidates.pop()
+}
+
+fn startup_local_proxy_key_override(profile: &ConfigProfile, state: &AppStateData) -> Option<String> {
+  resolve_profile_target(&profile.id, &state.keys.items, None).ok().map(|(_, target)| target.api_key)
+}
+
 #[tauri::command]
 async fn app_get_state(state: State<'_, SharedState>) -> Result<AppStateData, String> {
   Ok(state.data.read().await.clone())
@@ -94,25 +135,59 @@ async fn app_get_tools() -> Result<Vec<ToolProfile>, String> {
   Ok(supported_tools())
 }
 
-
 #[tauri::command]
-fn app_get_codex_auth_status(state: State<'_, SharedState>) -> CodexAuthStatus {
-  state.codex_auth.status()
+async fn app_get_codex_auth_status(state: State<'_, SharedState>) -> Result<CodexAuthStatus, String> {
+  Ok(enrich_codex_auth_status(&state, state.codex_auth.status()).await)
 }
 
 #[tauri::command]
-fn app_start_codex_login(state: State<'_, SharedState>, mode: String) -> Result<CodexAuthStatus, String> {
-  state.codex_auth.start_login(&mode)
+async fn app_start_codex_login(state: State<'_, SharedState>, mode: String) -> Result<CodexAuthStatus, String> {
+  let status = state.codex_auth.start_login(&mode)?;
+  Ok(enrich_codex_auth_status(&state, status).await)
 }
 
 #[tauri::command]
-fn app_cancel_codex_login(state: State<'_, SharedState>) -> Result<CodexAuthStatus, String> {
-  state.codex_auth.cancel_login()
+async fn app_cancel_codex_login(state: State<'_, SharedState>) -> Result<CodexAuthStatus, String> {
+  let status = state.codex_auth.cancel_login()?;
+  Ok(enrich_codex_auth_status(&state, status).await)
 }
 
 #[tauri::command]
-fn app_logout_codex(state: State<'_, SharedState>) -> Result<CodexAuthStatus, String> {
-  state.codex_auth.logout()
+async fn app_logout_codex(state: State<'_, SharedState>) -> Result<CodexAuthStatus, String> {
+  let status = state.codex_auth.logout()?;
+  Ok(enrich_codex_auth_status(&state, status).await)
+}
+
+async fn enrich_codex_auth_status(state: &SharedState, mut status: CodexAuthStatus) -> CodexAuthStatus {
+  let configured_key = status.configured_api_key.take();
+  let Some(configured_key) = configured_key.filter(|value| !value.trim().is_empty()) else {
+    return status;
+  };
+  let data = state.data.read().await.clone();
+  let effective_key = if status
+    .configured_base_url
+    .as_deref()
+    .is_some_and(|base_url| base_url.starts_with(LOCAL_PROXY_BASE_URL))
+  {
+    read_json::<LocalRouteManifest>(&local_route_manifest_path())
+      .ok()
+      .and_then(|manifest| startup_local_proxy_profile(&manifest))
+      .and_then(|profile| startup_local_proxy_key_override(&profile, &data))
+      .unwrap_or(configured_key)
+  } else {
+    configured_key
+  };
+  let matches = data
+    .keys
+    .items
+    .iter()
+    .filter(|item| item.key.as_deref().map(str::trim) == Some(effective_key.trim()))
+    .collect::<Vec<_>>();
+  if matches.len() == 1 {
+    status.configured_key_id = Some(matches[0].id);
+    status.configured_key_name = Some(matches[0].name.clone());
+  }
+  status
 }
 
 #[tauri::command]
@@ -122,21 +197,69 @@ fn app_open_codex_device_auth_page() -> Result<(), String> {
 
 #[tauri::command]
 async fn app_activate_codex_official(state: State<'_, SharedState>) -> Result<ConfigTransactionResult, String> {
+  activate_codex_official_inner(state.inner()).await
+}
+
+async fn activate_codex_official_inner(state: &SharedState) -> Result<ConfigTransactionResult, String> {
   if !state.codex_auth.status().authenticated {
     return Err("请先登录 OpenAI/ChatGPT 官方账户".into());
   }
   let _transaction_guard = state.config_transaction.lock().await;
-  run_config_file_transaction("切换到 OpenAI 官方账户前", activate_codex_official)
+  let result = run_config_file_transaction("切换到 OpenAI 官方账户前", activate_codex_official)?;
+  if !local_proxy_is_still_needed() {
+    stop_local_proxy().await;
+  }
+  Ok(result)
+}
+
+fn local_proxy_is_still_needed() -> bool {
+  let path = local_route_manifest_path();
+  if !path.exists() {
+    return false;
+  }
+  read_json::<LocalRouteManifest>(&path)
+    .map(|manifest| manifest_requires_local_proxy(&manifest))
+    // A corrupt manifest should already make the config transaction fail. If
+    // it changes concurrently, keep the listener alive rather than breaking
+    // a route whose ownership cannot be determined safely.
+    .unwrap_or(true)
+}
+
+fn manifest_requires_local_proxy(manifest: &LocalRouteManifest) -> bool {
+  manifest.entries.iter().any(|entry| entry.enabled)
+}
+
+#[cfg(test)]
+mod local_proxy_lifecycle_tests {
+  use super::manifest_requires_local_proxy;
+  use crate::models::{LocalRouteEntry, LocalRouteManifest};
+
+  #[test]
+  fn official_switch_stops_proxy_when_no_enabled_routes_remain() {
+    let manifest = LocalRouteManifest {
+      entries: vec![LocalRouteEntry { app: "claude".into(), enabled: false, ..Default::default() }],
+      ..Default::default()
+    };
+    assert!(!manifest_requires_local_proxy(&manifest));
+  }
+
+  #[test]
+  fn official_switch_keeps_proxy_for_an_enabled_non_codex_route() {
+    for app in ["claude", "opencode"] {
+      let manifest = LocalRouteManifest {
+        entries: vec![LocalRouteEntry { app: app.into(), enabled: true, ..Default::default() }],
+        ..Default::default()
+      };
+      assert!(manifest_requires_local_proxy(&manifest));
+    }
+  }
 }
 
 #[tauri::command]
 async fn app_check_update() -> Result<UpdateCheckResult, String> {
   let mainland_china = detect_mainland_china_exit_ip().await;
   let url = format!("https://api.github.com/repos/{GITHUB_UPDATE_REPOSITORY}/releases/latest");
-  let client = reqwest::Client::builder()
-    .user_agent("AI8888-tools-update-check")
-    .build()
-    .map_err(|err| err.to_string())?;
+  let client = reqwest::Client::builder().user_agent("AI8888-tools-update-check").build().map_err(|err| err.to_string())?;
 
   let response = match client.get(&url).send().await {
     Ok(response) => response,
@@ -178,10 +301,7 @@ async fn app_check_update() -> Result<UpdateCheckResult, String> {
     .and_then(serde_json::Value::as_str)
     .map(str::to_string)
     .or_else(|| Some(format!("https://github.com/{GITHUB_UPDATE_REPOSITORY}/releases")));
-  let update_available = latest_version
-    .as_deref()
-    .map(|version| compare_versions(version, CURRENT_APP_VERSION).is_gt())
-    .unwrap_or(false);
+  let update_available = latest_version.as_deref().map(|version| compare_versions(version, CURRENT_APP_VERSION).is_gt()).unwrap_or(false);
 
   let original_download = select_release_download_url(&value);
   let (download_url, download_accelerated) = if update_available {
@@ -206,7 +326,6 @@ async fn app_check_update() -> Result<UpdateCheckResult, String> {
     error: None,
   })
 }
-
 
 fn load_preferences() -> AppPreferences {
   read_json(&preferences_path()).unwrap_or_default()
@@ -253,12 +372,7 @@ async fn app_dismiss_alert(alert_id: String) -> Result<AppPreferences, String> {
 }
 
 #[tauri::command]
-async fn app_install_update(
-  app: tauri::AppHandle,
-  state: State<'_, SharedState>,
-  version: String,
-  prefer_accelerated: bool,
-) -> Result<UpdateInstallResult, String> {
+async fn app_install_update(app: tauri::AppHandle, state: State<'_, SharedState>, version: String, prefer_accelerated: bool) -> Result<UpdateInstallResult, String> {
   let version = version.trim();
   if version.is_empty() || version.chars().any(|ch| ch.is_control() || ch == '/' || ch == '\\') {
     return Err("invalid update version".into());
@@ -271,7 +385,10 @@ async fn app_install_update(
     if active.is_some() {
       return Err("an update download is already running".into());
     }
-    *active = Some(UpdateDownloadControl { task_id: task_id.clone(), cancel: cancel_sender });
+    *active = Some(UpdateDownloadControl {
+      task_id: task_id.clone(),
+      cancel: cancel_sender,
+    });
   }
   emit_update_progress(&app, &task_id, "preparing", 0, 0, "正在准备更新");
 
@@ -308,31 +425,25 @@ fn app_cancel_update(state: State<'_, SharedState>) -> Result<bool, String> {
 const UPDATE_CANCELED_ERROR: &str = "update download canceled";
 
 fn now_epoch_ms() -> u64 {
-  std::time::SystemTime::now()
-    .duration_since(std::time::UNIX_EPOCH)
-    .map(|value| value.as_millis() as u64)
-    .unwrap_or(0)
+  std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis() as u64).unwrap_or(0)
 }
 
 fn emit_update_progress(app: &tauri::AppHandle, task_id: &str, status: &str, downloaded_bytes: u64, total_bytes: u64, message: &str) {
   let percent = if total_bytes == 0 { 0.0 } else { (downloaded_bytes as f64 / total_bytes as f64 * 100.0).clamp(0.0, 100.0) };
-  let _ = app.emit("update-download-progress", UpdateDownloadProgress {
-    task_id: task_id.to_string(),
-    status: status.to_string(),
-    downloaded_bytes,
-    total_bytes,
-    percent,
-    message: message.to_string(),
-  });
+  let _ = app.emit(
+    "update-download-progress",
+    UpdateDownloadProgress {
+      task_id: task_id.to_string(),
+      status: status.to_string(),
+      downloaded_bytes,
+      total_bytes,
+      percent,
+      message: message.to_string(),
+    },
+  );
 }
 
-async fn run_update_install(
-  app: &tauri::AppHandle,
-  task_id: &str,
-  version: &str,
-  prefer_accelerated: bool,
-  mut cancel: watch::Receiver<bool>,
-) -> Result<UpdateInstallResult, String> {
+async fn run_update_install(app: &tauri::AppHandle, task_id: &str, version: &str, prefer_accelerated: bool, mut cancel: watch::Receiver<bool>) -> Result<UpdateInstallResult, String> {
   let client = reqwest::Client::builder()
     .user_agent("AI8888-tools-update-install")
     .connect_timeout(std::time::Duration::from_secs(15))
@@ -345,16 +456,12 @@ async fn run_update_install(
     result = &mut release_request => result?,
     _ = cancel.changed() => return Err(UPDATE_CANCELED_ERROR.into()),
   };
-  let latest_version = release
-    .get("tag_name")
-    .and_then(serde_json::Value::as_str)
-    .ok_or_else(|| "latest GitHub release has no tag name".to_string())?;
+  let latest_version = release.get("tag_name").and_then(serde_json::Value::as_str).ok_or_else(|| "latest GitHub release has no tag name".to_string())?;
   if latest_version != version {
     return Err(format!("requested update {version} is no longer the latest release ({latest_version})"));
   }
 
-  let asset = select_release_asset(&release)
-    .ok_or_else(|| format!("no installer asset is available for {}", current_os_family()))?;
+  let asset = select_release_asset(&release).ok_or_else(|| format!("no installer asset is available for {}", current_os_family()))?;
   validate_release_asset(&asset, version)?;
 
   ensure_app_dir().map_err(|err| err.to_string())?;
@@ -422,7 +529,9 @@ async fn run_update_install(
 }
 
 async fn cleanup_stale_update_parts(updates: &std::path::Path) {
-  let Ok(mut entries) = tokio::fs::read_dir(updates).await else { return; };
+  let Ok(mut entries) = tokio::fs::read_dir(updates).await else {
+    return;
+  };
   while let Ok(Some(entry)) = entries.next_entry().await {
     let file_name = entry.file_name();
     let name = file_name.to_string_lossy();
@@ -472,10 +581,7 @@ fn launch_installer(path: &std::path::Path) -> Result<bool, String> {
       let mut permissions = metadata.permissions();
       permissions.set_mode(permissions.mode() | 0o111);
       std::fs::set_permissions(path, permissions).map_err(|err| format!("无法设置 AppImage 执行权限: {err}"))?;
-      return std::process::Command::new(path)
-        .spawn()
-        .map(|_| true)
-        .map_err(|err| format!("AppImage 启动失败: {err}"));
+      return std::process::Command::new(path).spawn().map(|_| true).map_err(|err| format!("AppImage 启动失败: {err}"));
     }
     if name.ends_with(".deb") || name.ends_with(".rpm") {
       return std::process::Command::new("xdg-open")
@@ -544,12 +650,15 @@ fn select_release_asset(release: &serde_json::Value) -> Option<ReleaseAsset> {
     if download_url.is_empty() || score <= 0 {
       continue;
     }
-    candidates.push((score, ReleaseAsset {
-      name: name.to_string(),
-      download_url: download_url.to_string(),
-      size: asset.get("size").and_then(serde_json::Value::as_u64).unwrap_or(0),
-      digest: asset.get("digest").and_then(serde_json::Value::as_str).map(str::to_string),
-    }));
+    candidates.push((
+      score,
+      ReleaseAsset {
+        name: name.to_string(),
+        download_url: download_url.to_string(),
+        size: asset.get("size").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        digest: asset.get("digest").and_then(serde_json::Value::as_str).map(str::to_string),
+      },
+    ));
   }
   candidates.sort_by(|left, right| right.0.cmp(&left.0));
   candidates.into_iter().map(|(_, asset)| asset).next()
@@ -559,16 +668,7 @@ fn select_release_download_url(release: &serde_json::Value) -> Option<String> {
   select_release_asset(release).map(|asset| asset.download_url)
 }
 
-async fn download_update_asset(
-  app: &tauri::AppHandle,
-  task_id: &str,
-  client: &reqwest::Client,
-  url: &str,
-  expected_size: u64,
-  partial: &std::path::Path,
-  cancel: &mut watch::Receiver<bool>,
-  message: &str,
-) -> Result<String, String> {
+async fn download_update_asset(app: &tauri::AppHandle, task_id: &str, client: &reqwest::Client, url: &str, expected_size: u64, partial: &std::path::Path, cancel: &mut watch::Receiver<bool>, message: &str) -> Result<String, String> {
   if *cancel.borrow() {
     return Err(UPDATE_CANCELED_ERROR.into());
   }
@@ -597,7 +697,9 @@ async fn download_update_asset(
       result = response.chunk() => result.map_err(|err| err.to_string())?,
       _ = cancel.changed() => return Err(UPDATE_CANCELED_ERROR.into()),
     };
-    let Some(chunk) = chunk else { break; };
+    let Some(chunk) = chunk else {
+      break;
+    };
     downloaded = downloaded.saturating_add(chunk.len() as u64);
     if downloaded > expected_size {
       return Err(format!("installer exceeded expected size: expected {expected_size}, received at least {downloaded}"));
@@ -676,14 +778,9 @@ fn score_release_asset(name: &str) -> i32 {
 fn score_release_asset_for(os: &str, host_arch: &str, name: &str) -> i32 {
   let mut score = 0;
 
-  let is_windows = name.ends_with(".msi")
-    || name.ends_with("-setup.exe")
-    || name.ends_with("setup.exe")
-    || name.ends_with(".exe");
+  let is_windows = name.ends_with(".msi") || name.ends_with("-setup.exe") || name.ends_with("setup.exe") || name.ends_with(".exe");
   let is_macos = name.ends_with(".dmg") || name.ends_with(".pkg");
-  let is_linux = name.ends_with(".appimage")
-    || name.ends_with(".deb")
-    || name.ends_with(".rpm");
+  let is_linux = name.ends_with(".appimage") || name.ends_with(".deb") || name.ends_with(".rpm");
 
   match os {
     "windows" => {
@@ -754,8 +851,8 @@ fn score_release_asset_for(os: &str, host_arch: &str, name: &str) -> i32 {
 
 #[cfg(test)]
 mod update_download_tests {
-  use sha2::{Digest, Sha256};
   use super::{accelerate_github_download_url, score_release_asset, score_release_asset_for, validate_release_asset, verify_update_digest, ReleaseAsset, GITHUB_DOWNLOAD_ACCELERATOR_PREFIX};
+  use sha2::{Digest, Sha256};
 
   #[test]
   fn accelerates_github_download_url() {
@@ -817,21 +914,13 @@ mod update_download_tests {
 }
 
 async fn detect_mainland_china_exit_ip() -> bool {
-  let client = match reqwest::Client::builder()
-    .user_agent("AI8888-tools-update-check")
-    .timeout(std::time::Duration::from_secs(4))
-    .build()
-  {
+  let client = match reqwest::Client::builder().user_agent("AI8888-tools-update-check").timeout(std::time::Duration::from_secs(4)).build() {
     Ok(client) => client,
     Err(_) => return false,
   };
 
   // Prefer lightweight public endpoints; treat country code CN as mainland China.
-  let endpoints = [
-    "https://ipapi.co/country_code/",
-    "https://ipinfo.io/country",
-    "https://api.country.is/",
-  ];
+  let endpoints = ["https://ipapi.co/country_code/", "https://ipinfo.io/country", "https://api.country.is/"];
 
   for endpoint in endpoints {
     if let Ok(response) = client.get(endpoint).send().await {
@@ -857,22 +946,11 @@ async fn detect_mainland_china_exit_ip() -> bool {
 }
 
 fn country_code_is_mainland_china(value: &str) -> bool {
-  value
-    .chars()
-    .filter(|ch| ch.is_ascii_alphabetic())
-    .collect::<String>()
-    .eq_ignore_ascii_case("CN")
+  value.chars().filter(|ch| ch.is_ascii_alphabetic()).collect::<String>().eq_ignore_ascii_case("CN")
 }
 
 fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
-  let parse = |value: &str| {
-    value
-      .trim()
-      .trim_start_matches('v')
-      .split('.')
-      .map(|part| part.parse::<u64>().unwrap_or(0))
-      .collect::<Vec<_>>()
-  };
+  let parse = |value: &str| value.trim().trim_start_matches('v').split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
   let left = parse(left);
   let right = parse(right);
   let len = left.len().max(right.len());
@@ -897,16 +975,12 @@ async fn app_open_login_window(app: tauri::AppHandle, state: State<'_, SharedSta
   }
 
   if app.get_webview_window("login").is_none() {
-    tauri::WebviewWindowBuilder::new(
-      &app,
-      "login",
-      tauri::WebviewUrl::External(login_url.parse::<tauri::Url>().map_err(|err| err.to_string())?),
-    )
-    .title("AI8888 Login")
-    .inner_size(1100.0, 820.0)
-    .visible(true)
-    .build()
-    .map_err(|err| err.to_string())?;
+    tauri::WebviewWindowBuilder::new(&app, "login", tauri::WebviewUrl::External(login_url.parse::<tauri::Url>().map_err(|err| err.to_string())?))
+      .title("AI8888 Login")
+      .inner_size(1100.0, 820.0)
+      .visible(true)
+      .build()
+      .map_err(|err| err.to_string())?;
   } else if let Some(window) = app.get_webview_window("login") {
     let _ = window.show();
     let _ = window.set_focus();
@@ -914,20 +988,15 @@ async fn app_open_login_window(app: tauri::AppHandle, state: State<'_, SharedSta
   Ok(())
 }
 
-
 fn open_external_window(app: tauri::AppHandle, label: &str, title: &str, url: &str, width: f64, height: f64) -> Result<(), String> {
   let parsed_url = url.parse::<tauri::Url>().map_err(|err| err.to_string())?;
   if app.get_webview_window(label).is_none() {
-    tauri::WebviewWindowBuilder::new(
-      &app,
-      label,
-      tauri::WebviewUrl::External(parsed_url),
-    )
-    .title(title)
-    .inner_size(width, height)
-    .visible(true)
-    .build()
-    .map_err(|err| err.to_string())?;
+    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::External(parsed_url))
+      .title(title)
+      .inner_size(width, height)
+      .visible(true)
+      .build()
+      .map_err(|err| err.to_string())?;
   } else if let Some(window) = app.get_webview_window(label) {
     let _ = window.show();
     let _ = window.set_focus();
@@ -958,18 +1027,14 @@ async fn app_open_model_status_window(app: tauri::AppHandle) -> Result<(), Strin
 #[tauri::command]
 async fn app_open_codex_sessions_window(app: tauri::AppHandle) -> Result<(), String> {
   if app.get_webview_window("codex-sessions").is_none() {
-    tauri::WebviewWindowBuilder::new(
-      &app,
-      "codex-sessions",
-      tauri::WebviewUrl::App("index.html?view=sessions".into()),
-    )
-    .title("Codex \u{4f1a}\u{8bdd}\u{7ba1}\u{7406}")
-    .inner_size(1180.0, 780.0)
-    .min_inner_size(980.0, 640.0)
-    .resizable(true)
-    .visible(true)
-    .build()
-    .map_err(|err| err.to_string())?;
+    tauri::WebviewWindowBuilder::new(&app, "codex-sessions", tauri::WebviewUrl::App("index.html?view=sessions".into()))
+      .title("Codex \u{4f1a}\u{8bdd}\u{7ba1}\u{7406}")
+      .inner_size(1180.0, 780.0)
+      .min_inner_size(980.0, 640.0)
+      .resizable(true)
+      .visible(true)
+      .build()
+      .map_err(|err| err.to_string())?;
   } else if let Some(window) = app.get_webview_window("codex-sessions") {
     let _ = window.show();
     let _ = window.set_focus();
@@ -979,9 +1044,7 @@ async fn app_open_codex_sessions_window(app: tauri::AppHandle) -> Result<(), Str
 
 #[tauri::command]
 async fn app_list_codex_sessions() -> Result<Vec<CodexSessionMeta>, String> {
-  tauri::async_runtime::spawn_blocking(codex_sessions::scan_sessions)
-    .await
-    .map_err(|err| format!("failed to scan Codex sessions: {err}"))
+  tauri::async_runtime::spawn_blocking(codex_sessions::scan_sessions).await.map_err(|err| format!("failed to scan Codex sessions: {err}"))
 }
 
 #[tauri::command]
@@ -1008,55 +1071,276 @@ async fn app_repair_codex_session_visibility(requests: Vec<CodexSessionVisibilit
 }
 
 #[tauri::command]
-async fn app_login_with_password(
-  state: State<'_, SharedState>,
-  email: String,
-  password: String,
-) -> Result<AppStateData, String> {
+async fn app_login_with_password(state: State<'_, SharedState>, email: String, password: String) -> Result<AppStateData, String> {
   let result = state.api.login(&LoginPayload { email, password }).await.map_err(|err| err.to_string())?;
   apply_login_result(&state, result).await.map_err(|err| err.to_string())
 }
 
-
 fn clear_auth_state(data: &mut AppStateData) {
   let selected_tool = data.selected_tool.clone();
-  *data = AppStateData {
-    selected_tool,
-    ..Default::default()
-  };
+  *data = AppStateData { selected_tool, ..Default::default() };
 }
 
-fn requires_relogin(error: &str) -> bool {
-  let lower = error.to_ascii_lowercase();
-  error.contains("无法获取账号信息")
-    || lower.contains("not logged in")
-    || lower.contains("missing refresh token")
-    || lower.contains("please login again")
-    || lower.contains("please re-login")
-    || lower.contains("unauthorized")
-    || lower.contains("unauthenticated")
-    || lower.contains("invalid token")
-    || lower.contains("token expired")
-    || lower.contains("jwt")
-    || lower.contains("401")
-    || lower.contains("403")
+const SESSION_REFRESH_LEEWAY_SECS: u64 = 120;
+const SESSION_RELOGIN_MESSAGE: &str = "无法获取账号信息，请重新登录";
+
+#[derive(Debug, Clone)]
+struct SessionRefreshError {
+  kind: ApiErrorKind,
+  message: String,
 }
 
-fn relogin_error(error: impl ToString) -> String {
-  let text = error.to_string();
-  if requires_relogin(&text) {
-    "无法获取账号信息，请重新登录".into()
+#[derive(Debug, Clone)]
+enum SessionRefreshFlightResult {
+  Pending,
+  Finished(Result<(), SessionRefreshError>),
+}
+
+enum SessionRefreshRole {
+  Leader(watch::Sender<SessionRefreshFlightResult>),
+  Follower {
+    receiver: watch::Receiver<SessionRefreshFlightResult>,
+    leader_force: bool,
+  },
+}
+
+struct SessionRefreshFlight {
+  force: bool,
+  receiver: watch::Receiver<SessionRefreshFlightResult>,
+}
+
+fn unix_timestamp() -> u64 {
+  std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn session_expiration(session: &StoredSession) -> u64 {
+  let expires_at = normalize_session_epoch_seconds(session.expires_at);
+  if expires_at > 0 {
+    expires_at
+  } else if session.issued_at > 0 && session.expires_in > 0 {
+    normalize_session_epoch_seconds(session.issued_at).saturating_add(session.expires_in)
   } else {
-    text
+    0
   }
 }
 
-async fn clear_auth_and_persist(state: &State<'_, SharedState>, message: &str) -> Result<AppStateData, String> {
+fn normalize_session_epoch_seconds(timestamp: u64) -> u64 {
+  let mut normalized = timestamp;
+  while normalized >= 100_000_000_000 {
+    normalized /= 1_000;
+  }
+  normalized
+}
+
+fn session_needs_refresh_at(session: &StoredSession, now: u64) -> bool {
+  let expires_at = session_expiration(session);
+  expires_at > 0 && expires_at <= now.saturating_add(SESSION_REFRESH_LEEWAY_SECS)
+}
+
+fn refresh_error(error: AppError) -> SessionRefreshError {
+  SessionRefreshError {
+    kind: classify_api_error(&error),
+    message: error.to_string(),
+  }
+}
+
+#[cfg(test)]
+mod session_refresh_tests {
+  use super::{begin_session_refresh, finish_session_refresh, session_needs_refresh_at, SessionRefreshRole, SharedState, StoredSession, SESSION_REFRESH_LEEWAY_SECS};
+
+  fn session(issued_at: u64, expires_in: u64, expires_at: u64) -> StoredSession {
+    StoredSession {
+      access_token: "access".into(),
+      refresh_token: "refresh".into(),
+      expires_in,
+      issued_at,
+      expires_at,
+      account: None,
+    }
+  }
+
+  #[test]
+  fn refreshes_inside_leeway_but_not_before_it() {
+    let now = 1_700_000_000;
+    assert!(session_needs_refresh_at(&session(now - 1_000, 0, now + SESSION_REFRESH_LEEWAY_SECS), now));
+    assert!(!session_needs_refresh_at(&session(now - 1_000, 0, now + SESSION_REFRESH_LEEWAY_SECS + 1), now));
+  }
+
+  #[test]
+  fn derives_expiration_for_legacy_relative_session_metadata() {
+    let now = 1_700_000_000;
+    assert!(session_needs_refresh_at(&session(now - 3_500, 3_600, 0), now));
+    assert!(!session_needs_refresh_at(&session(0, 3_600, 0), now));
+  }
+
+  #[test]
+  fn tolerates_millisecond_timestamps_in_persisted_state() {
+    let now = 1_700_000_000;
+    assert!(session_needs_refresh_at(&session(0, 0, (now + 60) * 1_000), now));
+  }
+
+  #[tokio::test]
+  async fn abandoned_refresh_flight_does_not_block_future_leaders() {
+    let state = SharedState::new().expect("state");
+    let sender = match begin_session_refresh(&state, false).await {
+      SessionRefreshRole::Leader(sender) => sender,
+      SessionRefreshRole::Follower { .. } => panic!("first refresh must be leader"),
+    };
+    drop(sender);
+    assert!(matches!(begin_session_refresh(&state, true).await, SessionRefreshRole::Leader(_)));
+  }
+
+  #[tokio::test]
+  async fn force_follower_knows_when_leader_was_not_forced() {
+    let state = SharedState::new().expect("state");
+    let sender = match begin_session_refresh(&state, false).await {
+      SessionRefreshRole::Leader(sender) => sender,
+      SessionRefreshRole::Follower { .. } => panic!("first refresh must be leader"),
+    };
+    match begin_session_refresh(&state, true).await {
+      SessionRefreshRole::Follower { leader_force, .. } => assert!(!leader_force),
+      SessionRefreshRole::Leader(_) => panic!("second refresh must follow active leader"),
+    }
+    finish_session_refresh(&state, sender, Ok(())).await;
+  }
+}
+
+async fn clear_auth_and_persist(state: &SharedState, message: &str) -> Result<AppStateData, String> {
   let mut guard = state.data.write().await;
   clear_auth_state(&mut guard);
   guard.last_error = Some(message.to_string());
   persist_state(&guard).map_err(|err| err.to_string())?;
   Ok(guard.clone())
+}
+
+async fn begin_session_refresh(state: &SharedState, force: bool) -> SessionRefreshRole {
+  let mut guard = state.session_refresh.lock().await;
+  if let Some(flight) = guard.as_ref() {
+    if flight.receiver.has_changed().is_ok() {
+      return SessionRefreshRole::Follower {
+        receiver: flight.receiver.clone(),
+        leader_force: flight.force,
+      };
+    }
+    // The leader was cancelled before publishing a result. Clear the closed
+    // channel so the next caller can take ownership instead of following it
+    // forever.
+    *guard = None;
+  }
+  let (sender, receiver) = watch::channel(SessionRefreshFlightResult::Pending);
+  *guard = Some(SessionRefreshFlight { force, receiver });
+  SessionRefreshRole::Leader(sender)
+}
+
+async fn finish_session_refresh(state: &SharedState, sender: watch::Sender<SessionRefreshFlightResult>, result: Result<(), SessionRefreshError>) {
+  let mut guard = state.session_refresh.lock().await;
+  *guard = None;
+  drop(guard);
+  let _ = sender.send(SessionRefreshFlightResult::Finished(result));
+}
+
+async fn wait_for_session_refresh(mut receiver: watch::Receiver<SessionRefreshFlightResult>) -> Result<(), SessionRefreshError> {
+  loop {
+    let result = receiver.borrow().clone();
+    match result {
+      SessionRefreshFlightResult::Pending => {}
+      SessionRefreshFlightResult::Finished(result) => return result,
+    }
+    if receiver.changed().await.is_err() {
+      return Err(SessionRefreshError {
+        kind: ApiErrorKind::Other,
+        message: "session refresh was interrupted".into(),
+      });
+    }
+  }
+}
+
+async fn perform_session_refresh(state: &SharedState, observed_access_token: &str, force: bool) -> Result<AppStateData, SessionRefreshError> {
+  let session = {
+    let guard = state.data.read().await;
+    guard.session.clone().ok_or_else(|| SessionRefreshError {
+      kind: ApiErrorKind::Other,
+      message: "not logged in".into(),
+    })?
+  };
+
+  if session.access_token != observed_access_token || (!force && !session_needs_refresh_at(&session, unix_timestamp())) {
+    return Ok(state.data.read().await.clone());
+  }
+  if session.refresh_token.trim().is_empty() {
+    return Err(SessionRefreshError {
+      kind: ApiErrorKind::Other,
+      message: "missing refresh token; please log in again".into(),
+    });
+  }
+
+  let refreshed = state
+    .api
+    .refresh(&RefreshPayload {
+      refresh_token: session.refresh_token.clone(),
+    })
+    .await
+    .map_err(refresh_error)?;
+
+  let mut guard = state.data.write().await;
+  if guard.session.as_ref().map(|current| current.access_token.as_str()) != Some(session.access_token.as_str()) {
+    return Ok(guard.clone());
+  }
+  let account = guard.account.clone().or(session.account);
+  guard.session = Some(StoredSession {
+    access_token: refreshed.access_token,
+    refresh_token: refreshed.refresh_token,
+    expires_in: refreshed.expires_in,
+    issued_at: refreshed.issued_at,
+    expires_at: refreshed.expires_at,
+    account,
+  });
+  persist_state(&guard).map_err(|error| SessionRefreshError {
+    kind: ApiErrorKind::Other,
+    message: error.to_string(),
+  })?;
+  Ok(guard.clone())
+}
+
+async fn refresh_session_singleflight(state: &SharedState, observed_access_token: &str, force: bool) -> Result<AppStateData, SessionRefreshError> {
+  loop {
+    match begin_session_refresh(state, force).await {
+      SessionRefreshRole::Follower { receiver, leader_force } => match wait_for_session_refresh(receiver).await {
+        Ok(()) => {
+          let current = state.data.read().await.clone();
+          let token_unchanged = current.session.as_ref().map(|session| session.access_token.as_str()) == Some(observed_access_token);
+          if force && !leader_force && token_unchanged {
+            continue;
+          }
+          return Ok(current);
+        }
+        Err(error) => {
+          let current = state.data.read().await.clone();
+          return if current.session.as_ref().map(|session| session.access_token.as_str()) != Some(observed_access_token) {
+            Ok(current)
+          } else {
+            Err(error)
+          };
+        }
+      },
+      SessionRefreshRole::Leader(sender) => {
+        let result = perform_session_refresh(state, observed_access_token, force).await;
+        let signal = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        finish_session_refresh(state, sender, signal).await;
+        return result;
+      }
+    }
+  }
+}
+
+async fn user_facing_refresh_error(state: &SharedState, error: SessionRefreshError) -> String {
+  if error.kind == ApiErrorKind::InvalidRefreshToken {
+    return match clear_auth_and_persist(state, SESSION_RELOGIN_MESSAGE).await {
+      Ok(_) => SESSION_RELOGIN_MESSAGE.into(),
+      Err(persist_error) => format!("{SESSION_RELOGIN_MESSAGE}: {persist_error}"),
+    };
+  }
+  error.message
 }
 
 #[tauri::command]
@@ -1065,73 +1349,31 @@ async fn app_refresh_session(state: State<'_, SharedState>) -> Result<AppStateDa
     let guard = state.data.read().await;
     guard.session.clone().ok_or_else(|| "not logged in".to_string())?
   };
-  if session.refresh_token.is_empty() {
-    let message = "无法获取账号信息，请重新登录";
-    let _ = clear_auth_and_persist(&state, message).await?;
-    return Err(message.into());
+  if let Err(error) = refresh_session_singleflight(&state, &session.access_token, true).await {
+    return Err(user_facing_refresh_error(&state, error).await);
   }
-
-  let refreshed = match state
-    .api
-    .refresh(&RefreshPayload { refresh_token: session.refresh_token })
-    .await
-  {
-    Ok(value) => value,
-    Err(err) => {
-      let message = relogin_error(err);
-      if requires_relogin(&message) {
-        let _ = clear_auth_and_persist(&state, &message).await?;
-      }
-      return Err(message);
-    }
-  };
-
-  let account = match state.api.get_account(&refreshed.access_token).await {
-    Ok(value) => value,
-    Err(err) => {
-      let message = relogin_error(err);
-      if requires_relogin(&message) {
-        let _ = clear_auth_and_persist(&state, &message).await?;
-      }
-      return Err(message);
-    }
-  };
-
-  apply_login_result(&state, LoginResult { session: refreshed, account })
-    .await
-    .map_err(|err| err.to_string())
+  load_remote_state_inner(&state, false, true).await
 }
 
 async fn apply_login_result(state: &State<'_, SharedState>, result: LoginResult) -> Result<AppStateData, AppError> {
-  let mut account = result.account;
-  if let Ok(profile) = state.api.get_profile(&result.session.access_token).await {
-    account = merge_account(account, profile);
+  let token = result.session.access_token.clone();
+  let account = result.account;
+  {
+    let mut guard = state.data.write().await;
+    guard.session = Some(StoredSession {
+      access_token: result.session.access_token,
+      refresh_token: result.session.refresh_token,
+      expires_in: result.session.expires_in,
+      issued_at: result.session.issued_at,
+      expires_at: result.session.expires_at,
+      account: Some(account.clone()),
+    });
+    guard.account = Some(account.clone());
+    guard.login_window_open = false;
+    guard.last_error = None;
+    persist_state(&guard)?;
   }
-  let subscriptions = state.api.get_subscriptions(&result.session.access_token).await
-    .map_err(|err| AppError::Message(format!("无法确认订阅状态，请稍后重试：{err}")))?;
-  let subscription_progress = state.api.get_subscription_progress(&result.session.access_token).await.unwrap_or_default();
-  let api_groups = state.api.get_groups(&result.session.access_token).await
-    .map_err(|err| AppError::Message(format!("无法确认额度分组，请稍后重试：{err}")))?;
-  let keys = state.api.get_keys(&result.session.access_token).await
-    .map_err(|err| AppError::Message(format!("无法读取访问密钥，请稍后重试：{err}")))?;
-  let groups = merge_groups(api_groups, &subscriptions, &keys);
-
-  let mut guard = state.data.write().await;
-  guard.session = Some(StoredSession {
-    access_token: result.session.access_token,
-    refresh_token: result.session.refresh_token,
-    expires_in: result.session.expires_in,
-    account: Some(account.clone()),
-  });
-  guard.account = Some(account);
-  guard.subscriptions = subscriptions;
-  guard.subscription_progress = subscription_progress;
-  guard.groups = groups;
-  guard.keys = keys;
-  guard.login_window_open = false;
-  guard.last_error = None;
-  persist_state(&guard)?;
-  Ok(guard.clone())
+  hydrate_remote_state(state, &token, account, Vec::new()).await
 }
 
 fn groups_from_subscriptions(subscriptions: &[SubscriptionSummary]) -> Vec<GroupSummary> {
@@ -1199,45 +1441,125 @@ fn merge_account(mut base: AccountSummary, profile: AccountSummary) -> AccountSu
   base
 }
 
-#[tauri::command]
-async fn app_load_remote_state(state: State<'_, SharedState>) -> Result<AppStateData, String> {
-  let token = {
-    let guard = state.data.read().await;
-    guard.session.as_ref().map(|session| session.access_token.clone()).ok_or_else(|| "not logged in".to_string())?
-  };
+async fn hydrate_remote_state(state: &SharedState, token: &str, base_account: AccountSummary, mut warnings: Vec<String>) -> Result<AppStateData, AppError> {
+  let cached = state.data.read().await.clone();
+  let (profile_result, subscriptions_result, progress_result, groups_result, keys_result) = tokio::join!(
+    state.api.get_profile(token),
+    state.api.get_subscriptions(token),
+    state.api.get_subscription_progress(token),
+    state.api.get_groups(token),
+    state.api.get_keys(token),
+  );
 
-  // Account info is required for a valid session. Subscription expiry is informational only
-  // and must not force re-login.
-  let account = match state.api.get_account(&token).await {
-    Ok(value) => value,
-    Err(err) => {
-      let message = relogin_error(err);
-      if requires_relogin(&message) {
-        let _ = clear_auth_and_persist(&state, &message).await?;
-      }
-      return Err(message);
+  let account = match profile_result {
+    Ok(profile) => merge_account(base_account, profile),
+    Err(error) => {
+      warnings.push(format!("账户详情暂时不可用：{error}"));
+      base_account
     }
   };
-
-  let profile = state.api.get_profile(&token).await.unwrap_or_else(|_| account.clone());
-  let subscriptions = state.api.get_subscriptions(&token).await
-    .map_err(|err| format!("无法确认订阅状态，请稍后重试：{err}"))?;
-  let subscription_progress = state.api.get_subscription_progress(&token).await.unwrap_or_default();
-  let api_groups = state.api.get_groups(&token).await
-    .map_err(|err| format!("无法确认额度分组，请稍后重试：{err}"))?;
-  let keys = state.api.get_keys(&token).await
-    .map_err(|err| format!("无法读取访问密钥，请稍后重试：{err}"))?;
+  let subscriptions = match subscriptions_result {
+    Ok(subscriptions) => subscriptions,
+    Err(error) => {
+      warnings.push(format!("订阅信息暂时不可用：{error}"));
+      cached.subscriptions
+    }
+  };
+  let subscription_progress = match progress_result {
+    Ok(progress) => progress,
+    Err(error) => {
+      warnings.push(format!("订阅用量暂时不可用：{error}"));
+      cached.subscription_progress
+    }
+  };
+  let api_groups = match groups_result {
+    Ok(groups) => groups,
+    Err(error) => {
+      warnings.push(format!("分组信息暂时不可用：{error}"));
+      cached.groups
+    }
+  };
+  let keys = match keys_result {
+    Ok(keys) => keys,
+    Err(error) => {
+      warnings.push(format!("API Key 暂时不可用：{error}"));
+      cached.keys
+    }
+  };
   let groups = merge_groups(api_groups, &subscriptions, &keys);
 
   let mut guard = state.data.write().await;
-  guard.account = Some(merge_account(account, profile));
+  if guard.session.as_ref().map(|session| session.access_token.as_str()) != Some(token) {
+    return Ok(guard.clone());
+  }
+  guard.account = Some(account.clone());
+  if let Some(session) = guard.session.as_mut() {
+    session.account = Some(account);
+  }
   guard.subscriptions = subscriptions;
   guard.subscription_progress = subscription_progress;
   guard.groups = groups;
   guard.keys = keys;
-  guard.last_error = None;
-  persist_state(&guard).map_err(|err| err.to_string())?;
+  guard.login_window_open = false;
+  guard.last_error = (!warnings.is_empty()).then(|| warnings.join("\n"));
+  persist_state(&guard)?;
   Ok(guard.clone())
+}
+
+async fn load_remote_state_inner(state: &SharedState, refresh_on_unauthorized: bool, refresh_already_attempted: bool) -> Result<AppStateData, String> {
+  let mut session = {
+    let guard = state.data.read().await;
+    guard.session.clone().ok_or_else(|| "not logged in".to_string())?
+  };
+  let mut refresh_attempted = refresh_already_attempted;
+  let mut warnings = Vec::new();
+
+  if !refresh_attempted && session_needs_refresh_at(&session, unix_timestamp()) {
+    refresh_attempted = true;
+    match refresh_session_singleflight(state, &session.access_token, false).await {
+      Ok(refreshed_state) => {
+        session = refreshed_state.session.ok_or_else(|| "not logged in".to_string())?;
+      }
+      Err(error) if error.kind == ApiErrorKind::InvalidRefreshToken => {
+        return Err(user_facing_refresh_error(state, error).await);
+      }
+      Err(error) => warnings.push(format!("会话自动续期暂时失败：{}", error.message)),
+    }
+  }
+
+  let mut account_result = state.api.get_account(&session.access_token).await;
+  if account_result
+    .as_ref()
+    .err()
+    .is_some_and(|error| matches!(classify_api_error(error), ApiErrorKind::Unauthorized | ApiErrorKind::InvalidRefreshToken))
+    && refresh_on_unauthorized
+    && !refresh_attempted
+  {
+    refresh_attempted = true;
+    let observed_token = session.access_token.clone();
+    match refresh_session_singleflight(state, &observed_token, true).await {
+      Ok(refreshed_state) => {
+        session = refreshed_state.session.ok_or_else(|| "not logged in".to_string())?;
+        account_result = state.api.get_account(&session.access_token).await;
+      }
+      Err(error) => return Err(user_facing_refresh_error(state, error).await),
+    }
+  }
+
+  let account = match account_result {
+    Ok(account) => account,
+    Err(error) if refresh_attempted && matches!(classify_api_error(&error), ApiErrorKind::Unauthorized | ApiErrorKind::InvalidRefreshToken) => {
+      return Err("AI8888 access token verification failed after refresh".into());
+    }
+    Err(error) => return Err(error.to_string()),
+  };
+
+  hydrate_remote_state(state, &session.access_token, account, warnings).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn app_load_remote_state(state: State<'_, SharedState>) -> Result<AppStateData, String> {
+  load_remote_state_inner(&state, true, false).await
 }
 
 #[tauri::command]
@@ -1327,7 +1649,19 @@ async fn app_logout(state: State<'_, SharedState>) -> Result<AppStateData, Strin
 }
 
 #[tauri::command]
-async fn app_prepare_switch(state: State<'_, SharedState>, tool: String, base_url: Option<String>, api_key: String, model: Option<String>, review_model: Option<String>, local_routing_enabled: Option<bool>, local_route_apps: Option<Vec<String>>, local_route_model_map: Option<HashMap<String, String>>, local_route_preserve_claude_auth: Option<bool>, local_route_only: Option<bool>) -> Result<SwitchTarget, String> {
+async fn app_prepare_switch(
+  state: State<'_, SharedState>,
+  tool: String,
+  base_url: Option<String>,
+  api_key: String,
+  model: Option<String>,
+  review_model: Option<String>,
+  local_routing_enabled: Option<bool>,
+  local_route_apps: Option<Vec<String>>,
+  local_route_model_map: Option<HashMap<String, String>>,
+  local_route_preserve_claude_auth: Option<bool>,
+  local_route_only: Option<bool>,
+) -> Result<SwitchTarget, String> {
   let tool = match tool.as_str() {
     "codex" => ToolKind::Codex,
     "claude" => ToolKind::Claude,
@@ -1403,13 +1737,7 @@ async fn app_list_config_profiles(state: State<'_, SharedState>) -> Result<Vec<C
 }
 
 #[tauri::command]
-async fn app_save_config_profile(
-  app: tauri::AppHandle,
-  state: State<'_, SharedState>,
-  profile_id: Option<String>,
-  expected_updated_at: Option<u64>,
-  profile: ConfigProfileInput,
-) -> Result<ConfigProfile, String> {
+async fn app_save_config_profile(app: tauri::AppHandle, state: State<'_, SharedState>, profile_id: Option<String>, expected_updated_at: Option<u64>, profile: ConfigProfileInput) -> Result<ConfigProfile, String> {
   let _transaction_guard = state.config_transaction.lock().await;
   let saved = save_profile(profile_id.as_deref(), expected_updated_at, profile).map_err(|err| err.to_string())?;
   drop(_transaction_guard);
@@ -1418,12 +1746,7 @@ async fn app_save_config_profile(
 }
 
 #[tauri::command]
-async fn app_delete_config_profile(
-  app: tauri::AppHandle,
-  state: State<'_, SharedState>,
-  profile_id: String,
-  expected_updated_at: u64,
-) -> Result<(), String> {
+async fn app_delete_config_profile(app: tauri::AppHandle, state: State<'_, SharedState>, profile_id: String, expected_updated_at: u64) -> Result<(), String> {
   let _transaction_guard = state.config_transaction.lock().await;
   delete_profile(&profile_id, expected_updated_at).map_err(|err| err.to_string())?;
   drop(_transaction_guard);
@@ -1432,19 +1755,11 @@ async fn app_delete_config_profile(
 }
 
 #[tauri::command]
-async fn app_apply_config_profile(
-  state: State<'_, SharedState>,
-  profile_id: String,
-  api_key_override: Option<String>,
-) -> Result<ConfigTransactionResult, String> {
+async fn app_apply_config_profile(state: State<'_, SharedState>, profile_id: String, api_key_override: Option<String>) -> Result<ConfigTransactionResult, String> {
   apply_config_profile_inner(state.inner(), profile_id, api_key_override).await
 }
 
-async fn apply_config_profile_inner(
-  state: &SharedState,
-  profile_id: String,
-  api_key_override: Option<String>,
-) -> Result<ConfigTransactionResult, String> {
+async fn apply_config_profile_inner(state: &SharedState, profile_id: String, api_key_override: Option<String>) -> Result<ConfigTransactionResult, String> {
   let _transaction_guard = state.config_transaction.lock().await;
   let keys = state.data.read().await.keys.items.clone();
   let (profile, target) = resolve_profile_target(&profile_id, &keys, api_key_override).map_err(|err| err.to_string())?;
@@ -1473,9 +1788,7 @@ async fn app_restore_config_snapshot(state: State<'_, SharedState>, snapshot_id:
   let _transaction_guard = state.config_transaction.lock().await;
   let allowed = all_managed_config_paths();
   let (restored, recovery) = restore_snapshot(&snapshot_id, &allowed).map_err(|err| err.to_string())?;
-  let artifacts = restored.files.iter().map(|file| {
-    (file.path.clone(), format!("已恢复 {}", file.label))
-  }).collect();
+  let artifacts = restored.files.iter().map(|file| (file.path.clone(), format!("已恢复 {}", file.label))).collect();
   Ok(ConfigTransactionResult {
     snapshot: recovery,
     artifacts,
@@ -1516,19 +1829,20 @@ async fn app_get_local_route_statuses() -> Result<Vec<LocalRouteStatus>, String>
 #[tauri::command]
 async fn app_cleanup_local_route_takeover(state: State<'_, SharedState>) -> Result<ConfigTransactionResult, String> {
   let _transaction_guard = state.config_transaction.lock().await;
-  run_config_file_transaction("清理本地路由前", cleanup_local_route_takeover)
+  let result = run_config_file_transaction("清理本地路由前", cleanup_local_route_takeover)?;
+  stop_local_proxy().await;
+  Ok(result)
 }
 
 #[tauri::command]
 async fn app_restore_local_route_backups(state: State<'_, SharedState>) -> Result<ConfigTransactionResult, String> {
   let _transaction_guard = state.config_transaction.lock().await;
-  run_config_file_transaction("恢复旧版备份前", restore_local_route_backups)
+  let result = run_config_file_transaction("恢复旧版备份前", restore_local_route_backups)?;
+  stop_local_proxy().await;
+  Ok(result)
 }
 
-fn run_config_file_transaction(
-  label: &str,
-  operation: impl FnOnce() -> Result<Vec<(String, String)>, AppError>,
-) -> Result<ConfigTransactionResult, String> {
+fn run_config_file_transaction(label: &str, operation: impl FnOnce() -> Result<Vec<(String, String)>, AppError>) -> Result<ConfigTransactionResult, String> {
   let managed = managed_paths_for_route_cleanup();
   let allowed = all_managed_config_paths();
   let snapshot = create_snapshot(&managed, label).map_err(|err| err.to_string())?;
@@ -1561,7 +1875,9 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 fn tray_status_text(app: &tauri::AppHandle) -> String {
-  let Some(state) = app.try_state::<SharedState>() else { return "状态载入中".into(); };
+  let Some(state) = app.try_state::<SharedState>() else {
+    return "状态载入中".into();
+  };
   let official = if state.codex_auth.status().authenticated { "OpenAI 已登录" } else { "OpenAI 未登录" };
   let balance = state.data.try_read().ok().and_then(|data| data.account.as_ref().map(|account| account.balance));
   match balance {
@@ -1606,16 +1922,15 @@ fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
     TRAY_QUIT_ID => app.exit(0),
     TRAY_SESSIONS_ID => {
       let app = app.clone();
-      tauri::async_runtime::spawn(async move { let _ = app_open_codex_sessions_window(app).await; });
+      tauri::async_runtime::spawn(async move {
+        let _ = app_open_codex_sessions_window(app).await;
+      });
     }
     TRAY_OFFICIAL_ID => {
       let app = app.clone();
       tauri::async_runtime::spawn(async move {
         let state = app.state::<SharedState>();
-        if state.codex_auth.status().authenticated {
-          let _guard = state.config_transaction.lock().await;
-          let _ = run_config_file_transaction("托盘切换到 OpenAI 官方前", activate_codex_official);
-        }
+        let _ = activate_codex_official_inner(state.inner()).await;
         let _ = refresh_tray_menu(&app);
       });
     }
@@ -1648,10 +1963,7 @@ fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
 fn setup_system_tray(app: &tauri::App) -> tauri::Result<()> {
   let menu = build_tray_menu(app.handle())?;
 
-  let mut tray = TrayIconBuilder::with_id(TRAY_ID)
-    .menu(&menu)
-    .show_menu_on_left_click(false)
-    .tooltip("AI8888 Switch");
+  let mut tray = TrayIconBuilder::with_id(TRAY_ID).menu(&menu).show_menu_on_left_click(false).tooltip("AI8888 Switch");
   if let Some(icon) = app.default_window_icon() {
     tray = tray.icon(icon.clone());
   }
@@ -1680,14 +1992,48 @@ pub fn run() {
     }))
     .setup(|app| {
       let shared = SharedState::new().map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
-      let startup_api = shared.api.clone();
-      tauri::async_runtime::spawn(async move {
-        let _ = startup_api.ensure_best_endpoint().await;
-      });
-      if let Some(stored) = load_state() {
-        *shared.data.blocking_write() = stored;
+      if let Some(stored_state) = load_state() {
+        *shared.data.blocking_write() = stored_state;
       }
       app.manage(shared);
+      let app_handle = app.handle().clone();
+      tauri::async_runtime::spawn(async move {
+        let state = app_handle.state::<SharedState>();
+        let manifest = match read_json::<LocalRouteManifest>(&local_route_manifest_path()) {
+          Ok(manifest) if manifest.entries.iter().any(|entry| entry.enabled) => manifest,
+          _ => return,
+        };
+        let stored_state = state.data.read().await.clone();
+        let profile = startup_local_proxy_profile(&manifest);
+        let fallback_upstream_base_url = profile.as_ref().map(|profile| profile.base_url.clone()).unwrap_or_else(|| state.api.site_base_url());
+        let selected_key_available = stored_state
+          .selected_key_id
+          .is_some_and(|selected_key_id| stored_state.keys.items.iter().any(|key| key.id == selected_key_id && key.key.as_deref().is_some_and(|value| !value.trim().is_empty())));
+        let key_override = (!selected_key_available)
+          .then(|| profile.as_ref().and_then(|profile| startup_local_proxy_key_override(profile, &stored_state)))
+          .flatten();
+        let target = match build_local_proxy_recovery_target(&manifest, &stored_state, &fallback_upstream_base_url, key_override.as_deref()) {
+          Ok(target) => target,
+          Err(error) => {
+            eprintln!("local proxy startup recovery skipped: {error}");
+            return;
+          }
+        };
+        let statuses = detect_local_route_statuses();
+        let configs_current = target.local_route_apps.iter().all(|app| statuses.iter().any(|status| status.app == *app && status.detected));
+        let _transaction_guard = state.config_transaction.lock().await;
+        let result = if configs_current {
+          restore_local_proxy_from_state(&manifest, &stored_state, &fallback_upstream_base_url, key_override.as_deref())
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        } else {
+          write_switch_transaction(&target).await.map(|_| ())
+        };
+        if let Err(error) = result {
+          eprintln!("local proxy startup recovery failed: {error}");
+        }
+      });
       setup_system_tray(app)?;
       Ok(())
     })
@@ -1711,6 +2057,8 @@ pub fn run() {
       app_check_update,
       app_install_update,
       app_cancel_update,
+      app_get_local_proxy_status,
+      app_restart_local_proxy,
       app_get_preferences,
       app_set_preferences,
       app_complete_onboarding,
@@ -1784,8 +2132,3 @@ pub fn run() {
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
-
-
-
-
-

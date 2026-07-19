@@ -1,14 +1,64 @@
 use crate::config::{API_BASE_URL, SITE_BASE_URL};
 use crate::error::AppError;
-use crate::models::{AccountSummary, ApiKeySummary, AuthSession, EndpointProbeResult, EndpointProbeSummary, GroupSummary, LoginResult, ModelSummary, Pagination, SubscriptionProgressInfo, SubscriptionSummary};
+use crate::models::{deserialize_optional_u64, deserialize_timestamp, AccountSummary, ApiKeySummary, AuthSession, EndpointProbeResult, EndpointProbeSummary, GroupSummary, LoginResult, ModelSummary, Pagination, SubscriptionProgressInfo, SubscriptionSummary};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ENDPOINT_PROBE_DOMAINS: [&str; 3] = ["ai8888.shop", "www.ai8888.shop", "sub.ai8888.shop"];
 const ENDPOINT_PROBE_ATTEMPTS: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiErrorKind {
+  Unauthorized,
+  Forbidden,
+  InvalidRefreshToken,
+  Server,
+  Network,
+  Other,
+}
+
+pub fn classify_api_error(error: &AppError) -> ApiErrorKind {
+  match error {
+    AppError::Request(_) => ApiErrorKind::Network,
+    AppError::Message(message) => classify_api_message(message),
+    _ => ApiErrorKind::Other,
+  }
+}
+
+fn classify_api_message(message: &str) -> ApiErrorKind {
+  let lower = message.to_ascii_lowercase();
+  let status = api_status_from_message(message);
+  if matches!(status, Some(500..=599)) {
+    return ApiErrorKind::Server;
+  }
+  if lower.contains("timed out") || lower.contains("timeout") || lower.contains("connection refused") || lower.contains("connection reset") || lower.contains("dns") || lower.contains("network error") {
+    return ApiErrorKind::Network;
+  }
+  if lower.contains("refresh token rejected")
+    || lower.contains("invalid refresh token")
+    || lower.contains("refresh token is invalid")
+    || lower.contains("refresh token expired")
+    || lower.contains("expired refresh token")
+    || lower.contains("invalid_grant")
+  {
+    return ApiErrorKind::InvalidRefreshToken;
+  }
+
+  match status {
+    Some(401) => ApiErrorKind::Unauthorized,
+    Some(403) => ApiErrorKind::Forbidden,
+    _ => ApiErrorKind::Other,
+  }
+}
+
+fn api_status_from_message(message: &str) -> Option<u16> {
+  let rest = message.split_once("AI8888 API ")?.1;
+  let digits = rest.chars().skip_while(|character| !character.is_ascii_digit()).take(3).collect::<String>();
+  (digits.len() == 3).then(|| digits.parse().ok()).flatten()
+}
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -188,10 +238,7 @@ impl ApiClient {
 
   fn auth_headers(token: &str) -> Result<HeaderMap, AppError> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-      AUTHORIZATION,
-      HeaderValue::from_str(&format!("Bearer {token}")).map_err(|err| AppError::Message(err.to_string()))?,
-    );
+    headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).map_err(|err| AppError::Message(err.to_string()))?);
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(headers)
   }
@@ -225,7 +272,11 @@ impl ApiClient {
     let data = Self::data_or_self(value);
     if data.is_array() {
       let items: Vec<T> = serde_json::from_value(data).map_err(|err| AppError::Message(err.to_string()))?;
-      return Ok(Pagination { total: items.len() as u64, items, ..Default::default() });
+      return Ok(Pagination {
+        total: items.len() as u64,
+        items,
+        ..Default::default()
+      });
     }
     let mut page: Pagination<T> = serde_json::from_value(data.clone()).map_err(|err| AppError::Message(err.to_string()))?;
     if page.items.is_empty() {
@@ -250,31 +301,46 @@ impl ApiClient {
     let access_token = response.access_token.or(response.token).ok_or_else(|| AppError::Message("登录响应缺少 access token".into()))?;
     let account = response.user.or(response.account).unwrap_or_default();
     Ok(LoginResult {
-      session: AuthSession { access_token, refresh_token: response.refresh_token.unwrap_or_default(), expires_in: response.expires_in.unwrap_or(0) },
+      session: normalized_auth_session(access_token, response.refresh_token.unwrap_or_default(), response.expires_in.unwrap_or(0), response.issued_at, response.expires_at),
       account,
     })
   }
 
   pub async fn refresh(&self, payload: &RefreshPayload) -> Result<AuthSession, AppError> {
     let _ = self.ensure_best_endpoint().await;
-    let value = self.send_value(self.client.post(self.url("/auth/refresh")).json(payload)).await?;
+    let value = match self.send_value(self.client.post(self.url("/auth/refresh")).json(payload)).await {
+      Ok(value) => value,
+      Err(error) if classify_api_error(&error) == ApiErrorKind::Unauthorized => {
+        return Err(AppError::Message(format!("AI8888 refresh token rejected: {error}")));
+      }
+      Err(error) => return Err(error),
+    };
     let response: RefreshResponseData = Self::decode_data(value)?;
-    Ok(AuthSession {
-      access_token: response.access_token.or(response.token).unwrap_or_default(),
-      refresh_token: response.refresh_token.unwrap_or_else(|| payload.refresh_token.clone()),
-      expires_in: response.expires_in.unwrap_or(0),
-    })
+    let access_token = response
+      .access_token
+      .or(response.token)
+      .filter(|token| !token.trim().is_empty())
+      .ok_or_else(|| AppError::Message("AI8888 refresh response is missing an access token".into()))?;
+    Ok(normalized_auth_session(
+      access_token,
+      response.refresh_token.filter(|token| !token.trim().is_empty()).unwrap_or_else(|| payload.refresh_token.clone()),
+      response.expires_in.unwrap_or(0),
+      response.issued_at,
+      response.expires_at,
+    ))
   }
 
   pub async fn get_account(&self, token: &str) -> Result<AccountSummary, AppError> {
     let _ = self.ensure_best_endpoint().await;
+    let mut last_error = None;
     for path in ["/auth/me", "/user/profile", "/profile"] {
-      let result = self.send_value(self.client.get(self.url(path)).headers(Self::auth_headers(token)?)).await.and_then(Self::decode_data::<AccountSummary>);
-      if result.is_ok() {
-        return result;
+      match self.send_value(self.client.get(self.url(path)).headers(Self::auth_headers(token)?)).await.and_then(Self::decode_data::<AccountSummary>) {
+        Ok(account) => return Ok(account),
+        Err(error) if matches!(classify_api_error(&error), ApiErrorKind::Unauthorized | ApiErrorKind::Forbidden | ApiErrorKind::InvalidRefreshToken) => return Err(error),
+        Err(error) => last_error = Some(error),
       }
     }
-    Err(AppError::Message("无法获取账号信息".into()))
+    Err(last_error.unwrap_or_else(|| AppError::Message("无法获取账号信息".into())))
   }
 
   pub async fn get_profile(&self, token: &str) -> Result<AccountSummary, AppError> {
@@ -361,10 +427,7 @@ impl ApiClient {
     let mut last_error = String::new();
 
     for url in candidates {
-      let mut request = self
-        .client
-        .get(&url)
-        .header(AUTHORIZATION, format!("Bearer {}", query.api_key.trim()));
+      let mut request = self.client.get(&url).header(AUTHORIZATION, format!("Bearer {}", query.api_key.trim()));
       if let Some(ua) = &query.user_agent {
         request = request.header(USER_AGENT, ua);
       }
@@ -402,10 +465,7 @@ impl ApiClient {
   }
 
   pub async fn probe_best_endpoint(&self) -> Result<EndpointProbeSummary, AppError> {
-    let probe_client = reqwest::Client::builder()
-      .connect_timeout(Duration::from_secs(3))
-      .timeout(Duration::from_secs(5))
-      .build()?;
+    let probe_client = reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).timeout(Duration::from_secs(5)).build()?;
     let mut results = Vec::new();
 
     for domain in ENDPOINT_PROBE_DOMAINS {
@@ -488,8 +548,12 @@ struct LoginResponseData {
   token: Option<String>,
   #[serde(default, alias = "refresh_token")]
   refresh_token: Option<String>,
-  #[serde(default, alias = "expires_in")]
+  #[serde(default, alias = "expires_in", deserialize_with = "deserialize_optional_u64")]
   expires_in: Option<u64>,
+  #[serde(default, alias = "issued_at", deserialize_with = "deserialize_timestamp")]
+  issued_at: u64,
+  #[serde(default, alias = "expires_at", deserialize_with = "deserialize_timestamp")]
+  expires_at: u64,
   #[serde(default)]
   user: Option<AccountSummary>,
   #[serde(default)]
@@ -505,8 +569,36 @@ struct RefreshResponseData {
   token: Option<String>,
   #[serde(default, alias = "refresh_token")]
   refresh_token: Option<String>,
-  #[serde(default, alias = "expires_in")]
+  #[serde(default, alias = "expires_in", deserialize_with = "deserialize_optional_u64")]
   expires_in: Option<u64>,
+  #[serde(default, alias = "issued_at", deserialize_with = "deserialize_timestamp")]
+  issued_at: u64,
+  #[serde(default, alias = "expires_at", deserialize_with = "deserialize_timestamp")]
+  expires_at: u64,
+}
+
+fn normalized_auth_session(access_token: String, refresh_token: String, expires_in: u64, issued_at: u64, expires_at: u64) -> AuthSession {
+  let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+  let issued_at = normalize_epoch_seconds(issued_at);
+  let issued_at = if issued_at == 0 { now } else { issued_at };
+  let expires_at = normalize_epoch_seconds(expires_at);
+  let expires_at = if expires_at == 0 && expires_in > 0 { issued_at.saturating_add(expires_in) } else { expires_at };
+  let expires_in = if expires_in == 0 && expires_at > issued_at { expires_at - issued_at } else { expires_in };
+  AuthSession {
+    access_token,
+    refresh_token,
+    expires_in,
+    issued_at,
+    expires_at,
+  }
+}
+
+fn normalize_epoch_seconds(timestamp: u64) -> u64 {
+  if timestamp >= 100_000_000_000 {
+    timestamp / 1_000
+  } else {
+    timestamp
+  }
 }
 
 fn model_url_candidates(base_url: &str, is_full_url: bool, override_url: Option<&str>) -> Result<Vec<String>, AppError> {
@@ -524,9 +616,11 @@ fn model_url_candidates(base_url: &str, is_full_url: bool, override_url: Option<
   }
 
   let mut candidates = Vec::new();
-  if trimmed.rsplit('/').next().is_some_and(|segment| {
-    segment.strip_prefix('v').is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
-  }) {
+  if trimmed
+    .rsplit('/')
+    .next()
+    .is_some_and(|segment| segment.strip_prefix('v').is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())))
+  {
     candidates.push(format!("{trimmed}/models"));
   } else {
     candidates.push(format!("{trimmed}/v1/models"));
@@ -541,7 +635,6 @@ fn model_url_candidates(base_url: &str, is_full_url: bool, override_url: Option<
   }
   Ok(unique)
 }
-
 
 fn decode_groups_value(value: Value) -> Result<Vec<GroupSummary>, AppError> {
   let data = ApiClient::data_or_self(value);
@@ -561,4 +654,51 @@ fn decode_groups_value(value: Value) -> Result<Vec<GroupSummary>, AppError> {
   }
 
   Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod api_session_tests {
+  use super::{classify_api_error, normalized_auth_session, ApiErrorKind, LoginResponseData, RefreshResponseData};
+  use crate::error::AppError;
+
+  #[test]
+  fn classifies_auth_server_and_network_failures_separately() {
+    assert_eq!(classify_api_error(&AppError::Message("AI8888 API 401 Unauthorized: expired access token".into())), ApiErrorKind::Unauthorized);
+    assert_eq!(classify_api_error(&AppError::Message("AI8888 API 503 Service Unavailable".into())), ApiErrorKind::Server);
+    assert_eq!(classify_api_error(&AppError::Message("AI8888 API 403 Forbidden".into())), ApiErrorKind::Forbidden);
+    assert_eq!(classify_api_error(&AppError::Message("connection reset by peer".into())), ApiErrorKind::Network);
+  }
+
+  #[test]
+  fn only_explicit_refresh_rejection_is_invalid_refresh_token() {
+    assert_eq!(classify_api_error(&AppError::Message("AI8888 refresh token rejected: AI8888 API 401 Unauthorized".into())), ApiErrorKind::InvalidRefreshToken);
+    assert_ne!(classify_api_error(&AppError::Message("AI8888 API 500: invalid refresh token".into())), ApiErrorKind::InvalidRefreshToken);
+  }
+
+  #[test]
+  fn normalizes_absolute_and_relative_expiration() {
+    let relative = normalized_auth_session("access".into(), "refresh".into(), 3600, 1_700_000_000, 0);
+    assert_eq!(relative.expires_at, 1_700_003_600);
+
+    let absolute_millis = normalized_auth_session("access".into(), "refresh".into(), 0, 1_700_000_000_000, 1_700_003_600_000);
+    assert_eq!(absolute_millis.issued_at, 1_700_000_000);
+    assert_eq!(absolute_millis.expires_at, 1_700_003_600);
+    assert_eq!(absolute_millis.expires_in, 3600);
+  }
+
+  #[test]
+  fn login_and_refresh_accept_flexible_expires_in_values() {
+    for (value, expected) in [
+      (serde_json::Value::Null, None),
+      (serde_json::json!(3600), Some(3600)),
+      (serde_json::json!("7200"), Some(7200)),
+      (serde_json::json!("invalid"), None),
+    ] {
+      let login: LoginResponseData = serde_json::from_value(serde_json::json!({ "expires_in": value.clone() })).expect("login response should tolerate expires_in representation");
+      let refresh: RefreshResponseData = serde_json::from_value(serde_json::json!({ "expires_in": value })).expect("refresh response should tolerate expires_in representation");
+
+      assert_eq!(login.expires_in, expected);
+      assert_eq!(refresh.expires_in, expected);
+    }
+  }
 }

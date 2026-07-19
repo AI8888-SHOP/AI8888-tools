@@ -1,7 +1,34 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+fn parse_nonnegative_u64(value: Value) -> Option<u64> {
+  match value {
+    Value::Null => None,
+    Value::Number(number) => number.as_u64().or_else(|| number.as_f64().filter(|value| value.is_finite() && *value >= 0.0).map(|value| value as u64)),
+    Value::String(value) => value.trim().parse::<u64>().ok(),
+    _ => None,
+  }
+}
+
+/// Accept token timestamps returned as either JSON numbers or numeric strings.
+/// Older state files, nulls, and invalid values fall back to zero.
+pub fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  Ok(parse_nonnegative_u64(Value::deserialize(deserializer)?).unwrap_or_default())
+}
+
+/// Accept optional token durations returned as null, JSON numbers, or numeric strings.
+/// Invalid values are treated as missing so callers can use their normal fallback.
+pub fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  Ok(parse_nonnegative_u64(Value::deserialize(deserializer)?))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -10,8 +37,12 @@ pub struct AuthSession {
   pub access_token: String,
   #[serde(default, alias = "refresh_token")]
   pub refresh_token: String,
-  #[serde(default, alias = "expires_in")]
+  #[serde(default, alias = "expires_in", deserialize_with = "deserialize_timestamp")]
   pub expires_in: u64,
+  #[serde(default, alias = "issued_at", deserialize_with = "deserialize_timestamp")]
+  pub issued_at: u64,
+  #[serde(default, alias = "expires_at", deserialize_with = "deserialize_timestamp")]
+  pub expires_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -108,7 +139,17 @@ pub struct GroupSummary {
   pub weekly_limit_usd: Option<f64>,
   #[serde(default, alias = "monthly_limit_usd", alias = "monthly_limit", alias = "monthlyQuotaUsd")]
   pub monthly_limit_usd: Option<f64>,
-  #[serde(default, alias = "quota", alias = "quota_usd", alias = "monthly_quota", alias = "monthly_quota_usd", alias = "amount", alias = "amount_usd", alias = "credit", alias = "credit_usd")]
+  #[serde(
+    default,
+    alias = "quota",
+    alias = "quota_usd",
+    alias = "monthly_quota",
+    alias = "monthly_quota_usd",
+    alias = "amount",
+    alias = "amount_usd",
+    alias = "credit",
+    alias = "credit_usd"
+  )]
   pub quota: Option<f64>,
   #[serde(flatten)]
   pub extra: HashMap<String, Value>,
@@ -135,7 +176,17 @@ pub struct SubscriptionSummary {
   pub weekly_usage_usd: f64,
   #[serde(default, alias = "monthly_usage_usd")]
   pub monthly_usage_usd: f64,
-  #[serde(default, alias = "quota", alias = "quota_usd", alias = "monthly_quota", alias = "monthly_quota_usd", alias = "amount", alias = "amount_usd", alias = "credit", alias = "credit_usd")]
+  #[serde(
+    default,
+    alias = "quota",
+    alias = "quota_usd",
+    alias = "monthly_quota",
+    alias = "monthly_quota_usd",
+    alias = "amount",
+    alias = "amount_usd",
+    alias = "credit",
+    alias = "credit_usd"
+  )]
   pub quota: Option<f64>,
   #[serde(default, alias = "remaining", alias = "remaining_usd", alias = "balance", alias = "balance_usd")]
   pub remaining: Option<f64>,
@@ -336,6 +387,8 @@ pub struct LocalRouteEntry {
 #[serde(rename_all = "camelCase")]
 pub struct LocalRouteManifest {
   pub profile_name: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub upstream_base_url: Option<String>,
   pub updated_at: u64,
   pub entries: Vec<LocalRouteEntry>,
 }
@@ -360,7 +413,14 @@ pub struct LocalRouteStatus {
 pub struct StoredSession {
   pub access_token: String,
   pub refresh_token: String,
+  #[serde(default, alias = "expires_in", deserialize_with = "deserialize_timestamp")]
   pub expires_in: u64,
+  /// Unix timestamp (seconds) when the access token was issued.
+  #[serde(default, alias = "issued_at", deserialize_with = "deserialize_timestamp")]
+  pub issued_at: u64,
+  /// Unix timestamp (seconds) when the access token expires.
+  #[serde(default, alias = "expires_at", deserialize_with = "deserialize_timestamp")]
+  pub expires_at: u64,
   pub account: Option<AccountSummary>,
 }
 
@@ -466,4 +526,55 @@ pub struct ConfigTransactionResult {
   pub snapshot: ConfigSnapshotSummary,
   pub artifacts: Vec<(String, String)>,
   pub message: String,
+}
+
+#[cfg(test)]
+mod session_model_tests {
+  use super::StoredSession;
+
+  #[test]
+  fn stored_session_accepts_legacy_state_without_absolute_timestamps() {
+    let session: StoredSession = serde_json::from_value(serde_json::json!({
+      "accessToken": "access",
+      "refreshToken": "refresh",
+      "expiresIn": 3600,
+      "account": null
+    }))
+    .expect("legacy session should deserialize");
+
+    assert_eq!(session.issued_at, 0);
+    assert_eq!(session.expires_at, 0);
+  }
+
+  #[test]
+  fn stored_session_accepts_numeric_string_timestamps() {
+    let session: StoredSession = serde_json::from_value(serde_json::json!({
+      "accessToken": "access",
+      "refreshToken": "refresh",
+      "expiresIn": "3600",
+      "issued_at": "1700000000",
+      "expires_at": "1700003600",
+      "account": null
+    }))
+    .expect("numeric timestamp strings should deserialize");
+
+    assert_eq!(session.expires_in, 3_600);
+    assert_eq!(session.issued_at, 1_700_000_000);
+    assert_eq!(session.expires_at, 1_700_003_600);
+  }
+
+  #[test]
+  fn stored_session_defaults_null_or_invalid_duration_to_zero() {
+    for expires_in in [serde_json::Value::Null, serde_json::json!("invalid")] {
+      let session: StoredSession = serde_json::from_value(serde_json::json!({
+        "accessToken": "access",
+        "refreshToken": "refresh",
+        "expiresIn": expires_in,
+        "account": null
+      }))
+      .expect("invalid optional token duration should not discard the stored session");
+
+      assert_eq!(session.expires_in, 0);
+    }
+  }
 }

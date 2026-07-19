@@ -1,13 +1,14 @@
 use serde_json::json;
-use toml::value::Table as TomlTable;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use toml_edit::{table, value, DocumentMut, Item, TableLike};
 
 use crate::config::{local_route_manifest_path, normalize_api_base_url, normalize_base_url, path_for, read_json, write_json, write_text, LOCAL_PROXY_BASE_URL, LOCAL_PROXY_OPENAI_BASE_URL, LOCAL_PROXY_PROFILE_NAME, OPENAI_BASE_URL};
 use crate::error::AppError;
 use crate::models::{LocalRouteEntry, LocalRouteManifest, LocalRouteStatus, SwitchTarget, ToolProfile};
+use crate::workspace::{load_proxy_settings, load_proxy_settings_checked};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolKind {
@@ -78,16 +79,20 @@ pub fn default_switch_target(tool: ToolKind, base_url: &str, api_key: &str) -> S
     profile_name: "AI8888".into(),
     base_url: normalize_base_url(if base_url.trim().is_empty() { OPENAI_BASE_URL } else { base_url }),
     api_key: api_key.to_string(),
-    model: Some(match tool {
-      _ => "gpt-5.5",
-    }
-    .into()),
+    model: Some(
+      match tool {
+        _ => "gpt-5.5",
+      }
+      .into(),
+    ),
     review_model: Some("gpt-5.5".into()),
-    token_type: Some(match tool {
-      ToolKind::Claude => "ANTHROPIC_AUTH_TOKEN",
-      _ => "OPENAI_API_KEY",
-    }
-    .into()),
+    token_type: Some(
+      match tool {
+        ToolKind::Claude => "ANTHROPIC_AUTH_TOKEN",
+        _ => "OPENAI_API_KEY",
+      }
+      .into(),
+    ),
     local_routing_enabled: false,
     local_route_apps: Vec::new(),
     local_route_model_map: HashMap::new(),
@@ -117,96 +122,114 @@ fn parse_tool(tool: &str) -> Result<ToolKind, AppError> {
   }
 }
 
-
 fn read_json_value(path: &Path) -> serde_json::Value {
   fs::read_to_string(path).ok().and_then(|content| serde_json::from_str(&content).ok()).unwrap_or_else(|| json!({}))
 }
 
-fn toml_table() -> toml::map::Map<String, toml::Value> {
-  toml::map::Map::new()
+fn parse_codex_document(config_path: &Path, existing: &str) -> Result<DocumentMut, AppError> {
+  if existing.trim().is_empty() {
+    return Ok(DocumentMut::new());
+  }
+  existing
+    .parse::<DocumentMut>()
+    .map_err(|error| AppError::Message(format!("Codex config.toml parse failed at {}: {error}", config_path.display())))
 }
 
-fn ensure_toml_table<'a>(value: &'a mut toml::Value, key: &str) -> &'a mut toml::map::Map<String, toml::Value> {
-  let needs_insert = !value.get(key).map(|item| item.is_table()).unwrap_or(false);
-  if needs_insert {
-    value.as_table_mut().expect("root toml table").insert(key.to_string(), toml::Value::Table(toml_table()));
+// Keep the item's position and any comments attached to its value.
+fn set_codex_value(table_like: &mut dyn TableLike, key: &str, mut replacement: Item) {
+  let decor = table_like.get(key).and_then(Item::as_value).map(|item| item.decor().clone());
+  if let Some(decor) = decor {
+    if let Some(value) = replacement.as_value_mut() {
+      *value.decor_mut() = decor;
+    }
   }
-  value.get_mut(key).and_then(|item| item.as_table_mut()).expect("nested toml table")
+  if let Some(existing) = table_like.get_mut(key) {
+    *existing = replacement;
+  } else {
+    table_like.insert(key, replacement);
+  }
 }
 
-fn build_codex_config_merged(existing: &str, model: &str, review_model: &str, base_url: &str, api_key: &str, route_only: bool) -> String {
-  let mut root = existing
-    .parse::<toml::Value>()
-    .ok()
-    .filter(|value| value.is_table())
-    .unwrap_or_else(|| toml::Value::Table(toml_table()));
-  let root_table = root.as_table_mut().expect("root toml table");
-  root_table.insert("model_provider".into(), toml::Value::String("ai8888".into()));
-  if !route_only {
-    root_table.insert("model".into(), toml::Value::String(model.into()));
-    root_table.insert("review_model".into(), toml::Value::String(review_model.into()));
-    root_table.insert("model_reasoning_effort".into(), toml::Value::String("high".into()));
-    root_table.insert("disable_response_storage".into(), toml::Value::Boolean(true));
-    root_table.insert("network_access".into(), toml::Value::String("enabled".into()));
-    root_table.insert("windows_wsl_setup_acknowledged".into(), toml::Value::Boolean(true));
+fn ensure_codex_table<'a>(table_like: &'a mut dyn TableLike, key: &str) -> Result<&'a mut dyn TableLike, AppError> {
+  if let Some(existing) = table_like.get(key) {
+    if !existing.is_table_like() {
+      return Err(AppError::Message(format!("Codex config.toml key {key} must be a table")));
+    }
+  } else {
+    table_like.insert(key, table());
   }
+  table_like
+    .get_mut(key)
+    .and_then(Item::as_table_like_mut)
+    .ok_or_else(|| AppError::Message(format!("Codex config.toml key {key} must be a table")))
+}
 
-  let providers = ensure_toml_table(&mut root, "model_providers");
-  let mut ai8888 = toml_table();
-  ai8888.insert("name".into(), toml::Value::String("AI8888".into()));
-  ai8888.insert("base_url".into(), toml::Value::String(base_url.into()));
-  ai8888.insert("wire_api".into(), toml::Value::String("responses".into()));
-  ai8888.insert("experimental_bearer_token".into(), toml::Value::String(api_key.into()));
-  providers.insert("ai8888".into(), toml::Value::Table(ai8888));
-
-  if !route_only {
-    let features = ensure_toml_table(&mut root, "features");
-    features.insert("goals".into(), toml::Value::Boolean(true));
-    features.insert("responses_websockets_v2".into(), toml::Value::Boolean(true));
-  }
-
-  let mut output = toml::to_string_pretty(&root).unwrap_or_default();
+fn render_codex_document(document: DocumentMut) -> String {
+  let mut output = document.to_string();
   if !output.ends_with('\n') {
     output.push('\n');
   }
   output
 }
 
+fn build_codex_config_merged(config_path: &Path, existing: &str, model: &str, review_model: &str, base_url: &str, api_key: &str, route_only: bool) -> Result<String, AppError> {
+  let mut document = parse_codex_document(config_path, existing)?;
+  let root = document.as_table_mut();
+  set_codex_value(root, "model_provider", value("ai8888"));
+  if !route_only {
+    set_codex_value(root, "model", value(model));
+    set_codex_value(root, "review_model", value(review_model));
+    set_codex_value(root, "model_reasoning_effort", value("high"));
+    set_codex_value(root, "disable_response_storage", value(true));
+    set_codex_value(root, "network_access", value("enabled"));
+    set_codex_value(root, "windows_wsl_setup_acknowledged", value(true));
+  }
 
+  let providers = ensure_codex_table(root, "model_providers")?;
+  let ai8888 = ensure_codex_table(providers, "ai8888")?;
+  set_codex_value(ai8888, "name", value("AI8888"));
+  set_codex_value(ai8888, "base_url", value(base_url));
+  set_codex_value(ai8888, "wire_api", value("responses"));
+  set_codex_value(ai8888, "experimental_bearer_token", value(api_key));
+
+  if !route_only {
+    let features = ensure_codex_table(root, "features")?;
+    set_codex_value(features, "goals", value(true));
+    set_codex_value(features, "responses_websockets_v2", value(true));
+  }
+
+  Ok(render_codex_document(document))
+}
 
 fn write_codex(target: &SwitchTarget) -> Result<(), AppError> {
   let config_path = path_for("codex", "config.toml");
   let model = target.model.clone().unwrap_or_else(|| "gpt-5.5".into());
   let review_model = target.review_model.clone().unwrap_or_else(|| model.clone());
-  let existing = fs::read_to_string(&config_path).unwrap_or_default();
-  let config = build_codex_config_merged(&existing, &model, &review_model, &effective_base_url(target), effective_api_key(target), target.local_route_only);
+  let existing = if config_path.exists() {
+    fs::read_to_string(&config_path).map_err(|error| AppError::io(&config_path, error))?
+  } else {
+    String::new()
+  };
+  let api_key = effective_api_key(target)?;
+  let config = build_codex_config_merged(&config_path, &existing, &model, &review_model, &effective_base_url(target), &api_key, target.local_route_only)?;
   write_text(&config_path, &config)
 }
 
 pub fn activate_codex_official() -> Result<Vec<(String, String)>, AppError> {
   let config_path = path_for("codex", "config.toml");
-  let existing = fs::read_to_string(&config_path).unwrap_or_default();
-  let mut root = if existing.trim().is_empty() {
-    toml::Value::Table(toml_table())
+  let existing = if config_path.exists() {
+    fs::read_to_string(&config_path).map_err(|error| AppError::io(&config_path, error))?
   } else {
-    existing.parse::<toml::Value>().map_err(|error| AppError::Toml {
-      path: config_path.display().to_string(),
-      source: error,
-    })?
+    String::new()
   };
-  if !root.is_table() {
-    return Err(AppError::Message("Codex config.toml 根节点必须是 TOML 表".into()));
-  }
-  let root_table = root.as_table_mut().expect("Codex root should be a table");
-  root_table.insert("model_provider".into(), toml::Value::String("openai".into()));
+  let mut document = parse_codex_document(&config_path, &existing)?;
+  let root = document.as_table_mut();
+  set_codex_value(root, "model_provider", value("openai"));
   for key in ["model", "review_model", "openai_base_url", "chatgpt_base_url"] {
-    root_table.remove(key);
+    root.remove(key);
   }
 
-  let mut output = toml::to_string_pretty(&root)?;
-  if !output.ends_with('\n') {
-    output.push('\n');
-  }
+  let output = render_codex_document(document);
   write_text(&config_path, &output)?;
 
   let mut artifacts = vec![(config_path.display().to_string(), "Codex 已切换到 OpenAI 官方账户".into())];
@@ -236,16 +259,11 @@ fn write_claude(target: &SwitchTarget) -> Result<(), AppError> {
     *env = json!({});
   }
   let env = env.as_object_mut().expect("Claude env should be an object");
+  let effective_key = effective_api_key(target)?;
   let mut next_env = serde_json::Map::new();
   next_env.insert("ANTHROPIC_BASE_URL".into(), json!(effective_claude_base_url(target)));
-  if target.local_routing_enabled && target.local_route_preserve_claude_auth {
-    if let Some((key, value)) = existing_claude_auth_value() {
-      next_env.insert(key, json!(value));
-    }
-  } else {
-    next_env.insert("ANTHROPIC_API_KEY".into(), json!(effective_api_key(target)));
-    next_env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(effective_api_key(target)));
-  }
+  next_env.insert("ANTHROPIC_API_KEY".into(), json!(effective_key));
+  next_env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(effective_key));
   next_env.insert("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), json!("1"));
   next_env.insert("CLAUDE_CODE_ATTRIBUTION_HEADER".into(), json!("0"));
   if target.local_routing_enabled && !target.local_route_only {
@@ -282,15 +300,19 @@ fn write_opencode(target: &SwitchTarget) -> Result<(), AppError> {
   if !target.local_route_only {
     model_map.insert(model.clone(), json!({ "name": model }));
   }
-  provider.insert("ai8888".to_string(), json!({
-    "npm": "@ai-sdk/openai-compatible",
-    "name": "AI8888",
-    "options": {
-      "baseURL": effective_base_url(target),
-      "apiKey": effective_api_key(target)
-    },
-    "models": model_map
-  }));
+  let effective_key = effective_api_key(target)?;
+  provider.insert(
+    "ai8888".to_string(),
+    json!({
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "AI8888",
+      "options": {
+        "baseURL": effective_base_url(target),
+        "apiKey": effective_key
+      },
+      "models": model_map
+    }),
+  );
   write_json(&path, &value)
 }
 
@@ -312,17 +334,24 @@ fn write_openclaw(target: &SwitchTarget) -> Result<(), AppError> {
   if !providers.is_object() {
     *providers = json!({});
   }
-  providers.as_object_mut().expect("OpenClaw providers should be an object").insert("ai8888".to_string(), json!({
-    "baseUrl": effective_claude_base_url(target),
-    "apiKey": effective_api_key(target),
-    "api": "openai-completions",
-    "models": [{ "id": model, "name": model }]
-  }));
+  let effective_key = effective_api_key(target)?;
+  providers.as_object_mut().expect("OpenClaw providers should be an object").insert(
+    "ai8888".to_string(),
+    json!({
+      "baseUrl": effective_claude_base_url(target),
+      "apiKey": effective_key,
+      "api": "openai-completions",
+      "models": [{ "id": model, "name": model }]
+    }),
+  );
   let agents = root.entry("agents".to_string()).or_insert_with(|| json!({}));
   if agents.is_object() {
     let defaults = agents.as_object_mut().expect("OpenClaw agents should be an object").entry("defaults".to_string()).or_insert_with(|| json!({}));
     if defaults.is_object() {
-      defaults.as_object_mut().expect("OpenClaw defaults should be an object").insert("model".to_string(), json!({ "primary": format!("ai8888/{model}") }));
+      defaults
+        .as_object_mut()
+        .expect("OpenClaw defaults should be an object")
+        .insert("model".to_string(), json!({ "primary": format!("ai8888/{model}") }));
     }
   }
   write_json(&path, &value)
@@ -338,21 +367,19 @@ fn write_hermes(target: &SwitchTarget) -> Result<(), AppError> {
   }
   let root_map = root.as_mapping_mut().expect("Hermes root should be a mapping");
   let custom_key = serde_yaml::Value::String("custom_providers".to_string());
-  let mut providers = root_map
-    .get(&custom_key)
-    .and_then(|value| value.as_sequence())
-    .cloned()
-    .unwrap_or_default();
+  let mut providers = root_map.get(&custom_key).and_then(|value| value.as_sequence()).cloned().unwrap_or_default();
   let mut hermes_model_map = serde_json::Map::new();
   hermes_model_map.insert(model.clone(), json!({ "name": model.clone() }));
+  let effective_key = effective_api_key(target)?;
   let provider_value = serde_yaml::to_value(json!({
     "name": "ai8888",
     "base_url": effective_claude_base_url(target),
-    "api_key": effective_api_key(target),
+    "api_key": effective_key,
     "api_mode": "chat_completions",
     "model": model.clone(),
     "models": hermes_model_map
-  })).map_err(|err| AppError::Message(err.to_string()))?;
+  }))
+  .map_err(|err| AppError::Message(err.to_string()))?;
   if let Some(existing_provider) = providers.iter_mut().find(|item| item.get("name").and_then(|name| name.as_str()) == Some("ai8888")) {
     *existing_provider = provider_value;
   } else {
@@ -361,10 +388,7 @@ fn write_hermes(target: &SwitchTarget) -> Result<(), AppError> {
   root_map.insert(custom_key, serde_yaml::Value::Sequence(providers));
 
   let model_key = serde_yaml::Value::String("model".to_string());
-  let mut model_section = root_map
-    .get(&model_key)
-    .cloned()
-    .unwrap_or_else(|| serde_yaml::Value::Mapping(Default::default()));
+  let mut model_section = root_map.get(&model_key).cloned().unwrap_or_else(|| serde_yaml::Value::Mapping(Default::default()));
   if !model_section.is_mapping() {
     model_section = serde_yaml::Value::Mapping(Default::default());
   }
@@ -408,7 +432,9 @@ pub fn all_managed_config_paths() -> Vec<PathBuf> {
     path_for("gemini", ".env"),
     path_for("gemini", "settings.json"),
     local_route_manifest_path(),
-  ].into_iter().collect()
+  ]
+  .into_iter()
+  .collect()
 }
 
 pub fn managed_paths_for_route_cleanup() -> Vec<(PathBuf, String)> {
@@ -419,14 +445,14 @@ pub fn managed_paths_for_route_cleanup() -> Vec<(PathBuf, String)> {
     (path_for("gemini", ".env"), "Gemini .env".into()),
     (path_for("gemini", "settings.json"), "Gemini settings.json".into()),
     (local_route_manifest_path(), "本地路由清单".into()),
-  ].into_iter().collect()
+  ]
+  .into_iter()
+  .collect()
 }
 
 fn preview_entries_for_tool(tool: ToolKind, _local_routing_enabled: bool) -> Vec<(String, String)> {
   match tool {
-    ToolKind::Codex => vec![
-      (path_for("codex", "config.toml").display().to_string(), "Codex config.toml".into()),
-    ],
+    ToolKind::Codex => vec![(path_for("codex", "config.toml").display().to_string(), "Codex config.toml".into())],
     ToolKind::Claude => vec![(path_for("claude", "settings.json").display().to_string(), "Claude settings.json".into())],
     ToolKind::OpenCode => vec![(path_for("opencode", "opencode.json").display().to_string(), "OpenCode opencode.json".into())],
     ToolKind::OpenClaw => vec![(path_for("openclaw", "openclaw.json").display().to_string(), "OpenClaw openclaw.json".into())],
@@ -436,9 +462,7 @@ fn preview_entries_for_tool(tool: ToolKind, _local_routing_enabled: bool) -> Vec
 
 fn preview_entries_for_app(app: &str) -> Vec<(String, String)> {
   match app {
-    "codex" => vec![
-      (path_for("codex", "config.toml").display().to_string(), "Codex config.toml".into()),
-    ],
+    "codex" => vec![(path_for("codex", "config.toml").display().to_string(), "Codex config.toml".into())],
     "claude" => vec![(path_for("claude", "settings.json").display().to_string(), "Claude settings.json".into())],
     "opencode" => vec![(path_for("opencode", "opencode.json").display().to_string(), "OpenCode opencode.json".into())],
     _ => Vec::new(),
@@ -455,15 +479,26 @@ fn dedupe_preview_items(items: Vec<(String, String)>) -> Vec<(String, String)> {
   deduped
 }
 
-
-
-
-fn effective_api_key(target: &SwitchTarget) -> &str {
+fn effective_api_key(target: &SwitchTarget) -> Result<String, AppError> {
   if target.local_routing_enabled {
-    "PROXY_MANAGED"
+    let token = load_proxy_settings_checked()?.local_proxy_token;
+    if token.trim().is_empty() {
+      return Err(AppError::Message("local proxy bearer token is not configured".into()));
+    }
+    Ok(token)
   } else {
-    &target.api_key
+    Ok(target.api_key.clone())
   }
+}
+
+fn is_proxy_managed_key(value: Option<&str>) -> bool {
+  let value = value.map(str::trim).unwrap_or_default();
+  value == "PROXY_MANAGED" || (!value.is_empty() && value == load_proxy_settings().local_proxy_token.trim())
+}
+
+fn is_current_proxy_key(value: Option<&str>) -> bool {
+  let value = value.map(str::trim).unwrap_or_default();
+  !value.is_empty() && value == load_proxy_settings().local_proxy_token.trim()
 }
 
 fn effective_base_url(target: &SwitchTarget) -> String {
@@ -485,7 +520,6 @@ fn effective_claude_base_url(target: &SwitchTarget) -> String {
 pub fn write_local_route_manifest(target: &SwitchTarget) -> Result<(), AppError> {
   write_json(&local_route_manifest_path(), &build_local_route_manifest(target))
 }
-
 
 pub fn build_local_route_manifest(target: &SwitchTarget) -> LocalRouteManifest {
   let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0);
@@ -528,12 +562,12 @@ pub fn build_local_route_manifest(target: &SwitchTarget) -> LocalRouteManifest {
     });
   }
   LocalRouteManifest {
-    profile_name: LOCAL_PROXY_PROFILE_NAME.to_string(),
+    profile_name: target.profile_name.clone(),
+    upstream_base_url: Some(target.base_url.trim().trim_end_matches('/').to_string()),
     updated_at: now,
     entries,
   }
 }
-
 
 pub fn write_local_routed_targets(target: &SwitchTarget) -> Result<(), AppError> {
   if !target.local_routing_enabled {
@@ -542,12 +576,7 @@ pub fn write_local_routed_targets(target: &SwitchTarget) -> Result<(), AppError>
     return Ok(());
   }
 
-  let unsupported = target
-    .local_route_apps
-    .iter()
-    .filter(|app| !supports_local_route(app))
-    .cloned()
-    .collect::<Vec<_>>();
+  let unsupported = target.local_route_apps.iter().filter(|app| !supports_local_route(app)).cloned().collect::<Vec<_>>();
   if !unsupported.is_empty() {
     return Err(AppError::Message(format!("unsupported local-routing apps: {}", unsupported.join(", "))));
   }
@@ -586,7 +615,6 @@ fn verify_routed_app_written(app: &str, target: &SwitchTarget) -> Result<(), App
   }
 }
 
-
 fn supports_local_route(app: &str) -> bool {
   matches!(app, "codex" | "claude" | "opencode")
 }
@@ -619,7 +647,10 @@ fn verify_primary_target_written(target: &SwitchTarget) -> Result<(), AppError> 
 fn verify_codex_written(target: &SwitchTarget) -> Result<(), AppError> {
   let config_path = path_for("codex", "config.toml");
   let config_text = fs::read_to_string(&config_path).map_err(|err| AppError::io(&config_path, err))?;
-  let config_value: toml::Value = config_text.parse().map_err(|source| AppError::Toml { path: config_path.display().to_string(), source })?;
+  let config_value: toml::Value = config_text.parse().map_err(|source| AppError::Toml {
+    path: config_path.display().to_string(),
+    source,
+  })?;
   let config_table = config_value.as_table().ok_or_else(|| AppError::Message("Codex config.toml is not a TOML table".into()))?;
   let provider_id = config_table.get("model_provider").and_then(|value| value.as_str()).unwrap_or_default();
   if provider_id != "ai8888" {
@@ -638,8 +669,9 @@ fn verify_codex_written(target: &SwitchTarget) -> Result<(), AppError> {
     return Err(AppError::Message(format!("Codex base_url mismatch: expected {}, got {}", effective_base_url(target), base_url)));
   }
   let token = provider.get("experimental_bearer_token").and_then(|value| value.as_str()).unwrap_or_default();
-  if token != effective_api_key(target) {
-    return Err(AppError::Message(format!("Codex experimental_bearer_token mismatch: expected {}, got {token}", effective_api_key(target))));
+  let expected_key = effective_api_key(target)?;
+  if token != expected_key {
+    return Err(AppError::Message(format!("Codex experimental_bearer_token mismatch: expected {}, got {token}", expected_key)));
   }
   Ok(())
 }
@@ -655,12 +687,9 @@ fn verify_claude_written(target: &SwitchTarget) -> Result<(), AppError> {
   }
   let api_key = env.get("ANTHROPIC_API_KEY").and_then(|item| item.as_str()).unwrap_or_default();
   let auth_token = env.get("ANTHROPIC_AUTH_TOKEN").and_then(|item| item.as_str()).unwrap_or_default();
-  if target.local_routing_enabled && target.local_route_preserve_claude_auth {
-    if api_key == "PROXY_MANAGED" || auth_token == "PROXY_MANAGED" {
-      return Err(AppError::Message("Claude preserved auth unexpectedly replaced with PROXY_MANAGED".into()));
-    }
-  } else if api_key != effective_api_key(target) || auth_token != effective_api_key(target) {
-    return Err(AppError::Message(format!("Claude api key mismatch: expected {}, got api_key={}, auth_token={}", effective_api_key(target), api_key, auth_token)));
+  let expected_key = effective_api_key(target)?;
+  if api_key != expected_key || auth_token != expected_key {
+    return Err(AppError::Message(format!("Claude api key mismatch: expected {}, got api_key={}, auth_token={}", expected_key, api_key, auth_token)));
   }
   Ok(())
 }
@@ -678,8 +707,9 @@ fn verify_opencode_written(target: &SwitchTarget) -> Result<(), AppError> {
   if base_url != effective_base_url(target) {
     return Err(AppError::Message(format!("OpenCode baseURL mismatch: expected {}, got {base_url}", effective_base_url(target))));
   }
-  if api_key != effective_api_key(target) {
-    return Err(AppError::Message(format!("OpenCode apiKey mismatch: expected {}, got {api_key}", effective_api_key(target))));
+  let expected_key = effective_api_key(target)?;
+  if api_key != expected_key {
+    return Err(AppError::Message(format!("OpenCode apiKey mismatch: expected {}, got {api_key}", expected_key)));
   }
   Ok(())
 }
@@ -697,8 +727,9 @@ fn verify_openclaw_written(target: &SwitchTarget) -> Result<(), AppError> {
   if base_url != effective_claude_base_url(target) {
     return Err(AppError::Message(format!("OpenClaw baseUrl mismatch: expected {}, got {base_url}", effective_claude_base_url(target))));
   }
-  if api_key != effective_api_key(target) {
-    return Err(AppError::Message(format!("OpenClaw apiKey mismatch: expected {}, got {api_key}", effective_api_key(target))));
+  let expected_key = effective_api_key(target)?;
+  if api_key != expected_key {
+    return Err(AppError::Message(format!("OpenClaw apiKey mismatch: expected {}, got {api_key}", expected_key)));
   }
   Ok(())
 }
@@ -707,7 +738,10 @@ fn verify_hermes_written(target: &SwitchTarget) -> Result<(), AppError> {
   let path = path_for("hermes", "config.yaml");
   let content = fs::read_to_string(&path).map_err(|err| AppError::io(&path, err))?;
   let value: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|err| AppError::Message(format!("Hermes config.yaml parse failed: {err}")))?;
-  let providers = value.get("custom_providers").and_then(|item| item.as_sequence()).ok_or_else(|| AppError::Message("Hermes config.yaml missing custom_providers".into()))?;
+  let providers = value
+    .get("custom_providers")
+    .and_then(|item| item.as_sequence())
+    .ok_or_else(|| AppError::Message("Hermes config.yaml missing custom_providers".into()))?;
   let provider = providers
     .iter()
     .find(|item| item.get("name").and_then(|name| name.as_str()) == Some("ai8888"))
@@ -717,12 +751,12 @@ fn verify_hermes_written(target: &SwitchTarget) -> Result<(), AppError> {
   if base_url != effective_claude_base_url(target) {
     return Err(AppError::Message(format!("Hermes base_url mismatch: expected {}, got {base_url}", effective_claude_base_url(target))));
   }
-  if api_key != effective_api_key(target) {
-    return Err(AppError::Message(format!("Hermes api_key mismatch: expected {}, got {api_key}", effective_api_key(target))));
+  let expected_key = effective_api_key(target)?;
+  if api_key != expected_key {
+    return Err(AppError::Message(format!("Hermes api_key mismatch: expected {}, got {api_key}", expected_key)));
   }
   Ok(())
 }
-
 
 fn route_model(target: &SwitchTarget, key: &str) -> String {
   target
@@ -734,19 +768,6 @@ fn route_model(target: &SwitchTarget, key: &str) -> String {
     .unwrap_or_else(|| "gpt-5.5".into())
 }
 
-fn existing_claude_auth_value() -> Option<(String, String)> {
-  let settings = read_json_value(&path_for("claude", "settings.json"));
-  let env = settings.get("env")?.as_object()?;
-  for key in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
-    let value = env.get(key).and_then(|item| item.as_str()).unwrap_or("").trim();
-    if !value.is_empty() && value != "PROXY_MANAGED" {
-      return Some((key.to_string(), value.to_string()));
-    }
-  }
-  None
-}
-
-
 pub fn detect_local_route_statuses() -> Vec<LocalRouteStatus> {
   vec![detect_codex_local_route(), detect_claude_local_route(), detect_opencode_local_route()]
 }
@@ -756,9 +777,9 @@ fn status_detail(base_url_matched: bool, proxy_key_matched: bool, missing: bool)
     return "config missing".into();
   }
   match (base_url_matched, proxy_key_matched) {
-    (true, true) => "routed locally, key=PROXY_MANAGED".into(),
-    (true, false) => "routed locally, key is not PROXY_MANAGED".into(),
-    (false, true) => "key=PROXY_MANAGED but base URL is not local".into(),
+    (true, true) => "routed locally, local proxy token detected".into(),
+    (true, false) => "routed locally, local proxy token is missing".into(),
+    (false, true) => "local proxy token found but base URL is not local".into(),
     (false, false) => "local route not detected".into(),
   }
 }
@@ -769,7 +790,8 @@ fn detect_codex_local_route() -> LocalRouteStatus {
   let config = fs::read_to_string(&config_path).unwrap_or_default();
   let auth = fs::read_to_string(&auth_path).unwrap_or_default();
   let base_url_matched = config.contains(LOCAL_PROXY_OPENAI_BASE_URL);
-  let proxy_key_matched = config.contains("PROXY_MANAGED") || auth.contains("PROXY_MANAGED");
+  let proxy_token = load_proxy_settings().local_proxy_token;
+  let proxy_key_matched = !proxy_token.is_empty() && (config.contains(&proxy_token) || auth.contains(&proxy_token));
   let oauth_preserved = auth.contains("tokens") || auth.contains("id_token") || auth.contains("refresh_token") || auth.contains("access_token");
   let mcp_preserved = config.contains("[mcp_servers") || config.contains("[mcp_servers.");
   let missing = !config_path.exists() && !auth_path.exists();
@@ -802,8 +824,8 @@ fn detect_claude_local_route() -> LocalRouteStatus {
   let proxy_key_matched = env
     .and_then(|item| item.get("ANTHROPIC_AUTH_TOKEN").or_else(|| item.get("ANTHROPIC_API_KEY")))
     .and_then(|item| item.as_str())
-    .map(|item| item == "PROXY_MANAGED")
-    .unwrap_or_else(|| content.contains("PROXY_MANAGED"));
+    .map(|item| is_current_proxy_key(Some(item)))
+    .unwrap_or_else(|| content.contains(&load_proxy_settings().local_proxy_token));
   let missing = !config_path.exists();
   LocalRouteStatus {
     app: "claude".into(),
@@ -821,11 +843,7 @@ fn detect_opencode_local_route() -> LocalRouteStatus {
   let config_path = path_for("opencode", "opencode.json");
   let content = fs::read_to_string(&config_path).unwrap_or_default();
   let value: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
-  let options = value
-    .get("provider")
-    .and_then(|item| item.get("ai8888"))
-    .and_then(|item| item.get("options"))
-    .and_then(|item| item.as_object());
+  let options = value.get("provider").and_then(|item| item.get("ai8888")).and_then(|item| item.get("options")).and_then(|item| item.as_object());
   let base_url_matched = options
     .and_then(|item| item.get("baseURL"))
     .and_then(|item| item.as_str())
@@ -834,8 +852,8 @@ fn detect_opencode_local_route() -> LocalRouteStatus {
   let proxy_key_matched = options
     .and_then(|item| item.get("apiKey"))
     .and_then(|item| item.as_str())
-    .map(|item| item == "PROXY_MANAGED")
-    .unwrap_or_else(|| content.contains("PROXY_MANAGED"));
+    .map(|item| is_current_proxy_key(Some(item)))
+    .unwrap_or_else(|| content.contains(&load_proxy_settings().local_proxy_token));
   let missing = !config_path.exists();
   LocalRouteStatus {
     app: "opencode".into(),
@@ -889,12 +907,16 @@ pub fn cleanup_local_route_takeover() -> Result<Vec<(String, String)>, AppError>
   cleanup_claude_takeover(&mut changed)?;
   cleanup_opencode_takeover(&mut changed)?;
   cleanup_gemini_takeover(&mut changed)?;
-  write_json(&local_route_manifest_path(), &LocalRouteManifest {
-    profile_name: LOCAL_PROXY_PROFILE_NAME.to_string(),
-    updated_at: SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0),
-    entries: Vec::new(),
-  })?;
-    changed.push((local_route_manifest_path().display().to_string(), "local route manifest cleaned".into()));
+  write_json(
+    &local_route_manifest_path(),
+    &LocalRouteManifest {
+      profile_name: LOCAL_PROXY_PROFILE_NAME.to_string(),
+      upstream_base_url: None,
+      updated_at: SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0),
+      entries: Vec::new(),
+    },
+  )?;
+  changed.push((local_route_manifest_path().display().to_string(), "local route manifest cleaned".into()));
   Ok(changed)
 }
 
@@ -903,17 +925,24 @@ fn cleanup_codex_takeover(changed: &mut Vec<(String, String)>) -> Result<(), App
   if config_path.exists() {
     let content = fs::read_to_string(&config_path).map_err(|err| AppError::io(&config_path, err))?;
     if content.contains("experimental_bearer_token") || content.contains(LOCAL_PROXY_OPENAI_BASE_URL) {
-      let mut doc = content.parse::<toml::Value>().unwrap_or_else(|_| toml::Value::Table(TomlTable::new()));
-      if let Some(table) = doc.as_table_mut() {
-        if let Some(providers) = table.get_mut("model_providers").and_then(|value| value.as_table_mut()) {
-          if let Some(provider) = providers.get_mut("ai8888").and_then(|value| value.as_table_mut()) {
+      let mut document = parse_codex_document(&config_path, &content)?;
+      let mut changed_config = false;
+      if let Some(providers) = document.get_mut("model_providers").and_then(Item::as_table_like_mut) {
+        if let Some(provider) = providers.get_mut("ai8888").and_then(Item::as_table_like_mut) {
+          if is_proxy_managed_key(provider.get("experimental_bearer_token").and_then(Item::as_str)) {
             provider.remove("experimental_bearer_token");
-            provider.insert("base_url".into(), toml::Value::String(OPENAI_BASE_URL.into()));
+            changed_config = true;
+          }
+          if provider.get("base_url").and_then(Item::as_str).map(|base_url| base_url.trim_end_matches('/') == LOCAL_PROXY_OPENAI_BASE_URL).unwrap_or(false) {
+            set_codex_value(provider, "base_url", value(OPENAI_BASE_URL));
+            changed_config = true;
           }
         }
       }
-      write_text(&config_path, &toml::to_string_pretty(&doc).unwrap_or_default())?;
-      changed.push((config_path.display().to_string(), "Codex cleanup".into()));
+      if changed_config {
+        write_text(&config_path, &render_codex_document(document))?;
+        changed.push((config_path.display().to_string(), "Codex cleanup".into()));
+      }
     }
   }
   Ok(())
@@ -933,15 +962,18 @@ fn cleanup_claude_takeover(changed: &mut Vec<(String, String)>) -> Result<(), Ap
       env.remove("ANTHROPIC_BASE_URL");
     }
     for key in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
-      if env.get(key).and_then(|item| item.as_str()) == Some("PROXY_MANAGED") {
+      if is_proxy_managed_key(env.get(key).and_then(|item| item.as_str())) {
         env.remove(key);
       }
     }
     for key in [
       "ANTHROPIC_MODEL",
-      "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
-      "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
-      "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
     ] {
       env.remove(key);
     }
@@ -962,17 +994,13 @@ fn cleanup_opencode_takeover(changed: &mut Vec<(String, String)>) -> Result<(), 
   }
   let mut value: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
   let mut changed_config = false;
-  if let Some(provider) = value
-    .get_mut("provider")
-    .and_then(|item| item.get_mut("ai8888"))
-    .and_then(|item| item.as_object_mut())
-  {
+  if let Some(provider) = value.get_mut("provider").and_then(|item| item.get_mut("ai8888")).and_then(|item| item.as_object_mut()) {
     if let Some(options) = provider.get_mut("options").and_then(|item| item.as_object_mut()) {
       if options.get("baseURL").and_then(|item| item.as_str()).map(|item| item.trim_end_matches('/') == LOCAL_PROXY_OPENAI_BASE_URL).unwrap_or(false) {
         options.insert("baseURL".to_string(), json!(OPENAI_BASE_URL));
         changed_config = true;
       }
-      if options.get("apiKey").and_then(|item| item.as_str()) == Some("PROXY_MANAGED") {
+      if is_proxy_managed_key(options.get("apiKey").and_then(|item| item.as_str())) {
         options.remove("apiKey");
         changed_config = true;
       }
@@ -1020,7 +1048,6 @@ fn cleanup_gemini_takeover(changed: &mut Vec<(String, String)>) -> Result<(), Ap
   }
   Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1078,6 +1105,68 @@ mod tests {
     });
   }
 
+  #[test]
+  fn codex_write_preserves_comments_unknown_fields_and_existing_order() {
+    with_test_home("codex-preserve-format", || {
+      let config_path = path_for("codex", "config.toml");
+      let original = r#"# root comment
+first_unknown = "first"
+model_provider = "old" # keep provider comment
+second_unknown = "second"
+
+[unrelated_before]
+enabled = true # keep before comment
+
+[model_providers.ai8888]
+base_url = "https://old.example/v1" # keep endpoint comment
+future_provider_option = "keep"
+
+[unrelated_after]
+mode = "keep"
+"#;
+      write_text(&config_path, original).expect("seed codex config");
+
+      write_switch_target(&target("codex")).expect("write codex");
+
+      let config = fs::read_to_string(&config_path).expect("read codex config");
+      assert!(config.contains("# root comment"));
+      assert!(config.contains("model_provider = \"ai8888\" # keep provider comment"));
+      assert!(config.contains("base_url = \"https://sub.ai8888.shop/v1\" # keep endpoint comment"));
+      assert!(config.contains("future_provider_option = \"keep\""));
+      assert!(config.contains("enabled = true # keep before comment"));
+      assert!(config.find("first_unknown").unwrap() < config.find("model_provider").unwrap());
+      assert!(config.find("model_provider").unwrap() < config.find("second_unknown").unwrap());
+      assert!(config.find("[unrelated_before]").unwrap() < config.find("[model_providers.ai8888]").unwrap());
+      assert!(config.find("[model_providers.ai8888]").unwrap() < config.find("[unrelated_after]").unwrap());
+    });
+  }
+
+  #[test]
+  fn codex_write_rejects_malformed_toml_without_overwriting_it() {
+    with_test_home("codex-malformed", || {
+      let config_path = path_for("codex", "config.toml");
+      let malformed = "# must survive\nmodel_provider = \"old\"\n[broken\n";
+      write_text(&config_path, malformed).expect("seed malformed codex config");
+
+      let error = write_switch_target(&target("codex")).expect_err("malformed config must be rejected");
+
+      assert!(error.to_string().contains("parse failed"));
+      assert_eq!(fs::read_to_string(&config_path).expect("read malformed config"), malformed);
+    });
+  }
+
+  #[test]
+  fn codex_official_switch_rejects_malformed_toml_without_overwriting_it() {
+    with_test_home("codex-official-malformed", || {
+      let config_path = path_for("codex", "config.toml");
+      let malformed = "model_provider = \"ai8888\"\n[model_providers.ai8888\n";
+      write_text(&config_path, malformed).expect("seed malformed codex config");
+
+      activate_codex_official().expect_err("malformed config must be rejected");
+
+      assert_eq!(fs::read_to_string(&config_path).expect("read malformed config"), malformed);
+    });
+  }
 
   #[test]
   fn codex_official_switch_preserves_auth_and_other_routes() {
@@ -1086,7 +1175,7 @@ mod tests {
       let auth_path = path_for("codex", "auth.json");
       write_text(
         &config_path,
-        "model_provider = \"ai8888\"\nmodel = \"gpt-ai\"\nreview_model = \"gpt-review\"\nopenai_base_url = \"https://proxy.example/v1\"\n[model_providers.ai8888]\nbase_url = \"https://sub.ai8888.shop/v1\"\nexperimental_bearer_token = \"sk-secret\"\n",
+        "# official root comment\nfuture_first = \"first\"\nmodel_provider = \"ai8888\" # keep provider comment\nfuture_second = \"second\"\nmodel = \"gpt-ai\"\nreview_model = \"gpt-review\"\nopenai_base_url = \"https://proxy.example/v1\"\n[model_providers.ai8888]\nbase_url = \"https://sub.ai8888.shop/v1\"\nexperimental_bearer_token = \"sk-secret\"\nfuture_provider_option = \"keep\"\n",
       )
       .expect("seed codex config");
       write_text(&auth_path, "{\"tokens\":{\"access_token\":\"oauth\"}}\n").expect("seed codex auth");
@@ -1094,10 +1183,11 @@ mod tests {
         &local_route_manifest_path(),
         &LocalRouteManifest {
           profile_name: LOCAL_PROXY_PROFILE_NAME.into(),
+          upstream_base_url: Some("https://custom.example".into()),
           updated_at: 1,
           entries: vec![
-            LocalRouteEntry { app: "codex".into(), ..Default::default() },
-            LocalRouteEntry { app: "claude".into(), ..Default::default() },
+            LocalRouteEntry { app: "codex".into(), enabled: true, ..Default::default() },
+            LocalRouteEntry { app: "claude".into(), enabled: true, ..Default::default() },
           ],
         },
       )
@@ -1105,19 +1195,51 @@ mod tests {
 
       activate_codex_official().expect("activate official");
       let config = fs::read_to_string(&config_path).expect("read codex config");
+      assert!(config.contains("# official root comment"));
+      assert!(config.contains("model_provider = \"openai\" # keep provider comment"));
+      assert!(config.contains("future_provider_option = \"keep\""));
+      assert!(config.find("future_first").unwrap() < config.find("model_provider").unwrap());
+      assert!(config.find("model_provider").unwrap() < config.find("future_second").unwrap());
       let value = config.parse::<toml::Value>().expect("parse codex config");
       assert_eq!(value.get("model_provider").and_then(toml::Value::as_str), Some("openai"));
       assert!(value.get("model").is_none());
       assert!(value.get("review_model").is_none());
       assert!(value.get("openai_base_url").is_none());
       assert_eq!(
-        value.get("model_providers").and_then(|item| item.get("ai8888")).and_then(|item| item.get("experimental_bearer_token")).and_then(toml::Value::as_str),
+        value
+          .get("model_providers")
+          .and_then(|item| item.get("ai8888"))
+          .and_then(|item| item.get("experimental_bearer_token"))
+          .and_then(toml::Value::as_str),
         Some("sk-secret"),
       );
       assert_eq!(fs::read_to_string(&auth_path).expect("read codex auth"), "{\"tokens\":{\"access_token\":\"oauth\"}}\n");
       let manifest: LocalRouteManifest = read_json(&local_route_manifest_path()).expect("read route manifest");
       assert_eq!(manifest.entries.len(), 1);
       assert_eq!(manifest.entries[0].app, "claude");
+      assert!(manifest.entries[0].enabled);
+    });
+  }
+
+  #[test]
+  fn codex_official_switch_removes_the_last_local_route() {
+    with_test_home("codex-official-last-route", || {
+      write_text(&path_for("codex", "config.toml"), "model_provider = \"ai8888\"\n").expect("seed codex config");
+      write_json(
+        &local_route_manifest_path(),
+        &LocalRouteManifest {
+          upstream_base_url: Some("https://custom.example".into()),
+          entries: vec![LocalRouteEntry { app: "codex".into(), enabled: true, ..Default::default() }],
+          ..Default::default()
+        },
+      )
+      .expect("seed route manifest");
+
+      activate_codex_official().expect("activate official");
+
+      let manifest: LocalRouteManifest = read_json(&local_route_manifest_path()).expect("read route manifest");
+      assert!(manifest.entries.is_empty());
+      assert_eq!(manifest.upstream_base_url.as_deref(), Some("https://custom.example"));
     });
   }
 
@@ -1125,10 +1247,14 @@ mod tests {
   fn claude_write_updates_env_and_preserves_other_settings() {
     with_test_home("claude", || {
       let path = path_for("claude", "settings.json");
-      write_json(&path, &json!({
-        "permissions": { "allow": ["Bash(ls)"] },
-        "env": { "OLD": "remove-me" }
-      })).expect("seed claude");
+      write_json(
+        &path,
+        &json!({
+          "permissions": { "allow": ["Bash(ls)"] },
+          "env": { "OLD": "remove-me" }
+        }),
+      )
+      .expect("seed claude");
       write_switch_target(&target("claude")).expect("write claude");
       let value: serde_json::Value = read_json(&path).expect("read claude");
       assert_eq!(value["permissions"]["allow"][0], "Bash(ls)");
@@ -1140,32 +1266,41 @@ mod tests {
     });
   }
 
-
-
   #[test]
   fn local_route_manifest_defaults_are_not_used_when_ui_passes_claude_only() {
     let mut t = target("claude");
+    t.profile_name = "Manual Claude route".to_string();
+    t.base_url = "https://custom.example/root/".to_string();
     t.local_routing_enabled = true;
     t.local_route_apps = vec!["claude".to_string()];
     t.local_route_model_map = HashMap::from([("sonnet".to_string(), "gpt-sonnet".to_string())]);
     let manifest = build_local_route_manifest(&t);
     assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.profile_name, "Manual Claude route");
+    assert_eq!(manifest.upstream_base_url.as_deref(), Some("https://custom.example/root"));
     assert_eq!(manifest.entries[0].app, "claude");
     assert_eq!(manifest.entries[0].local_api_key, "PROXY_MANAGED");
     assert_eq!(manifest.entries[0].model_map.get("sonnet").map(String::as_str), Some("gpt-sonnet"));
   }
-
 
   #[test]
   fn local_route_only_opencode_does_not_modify_unselected_codex_or_claude() {
     with_test_home("route-opencode-only", || {
       let codex_path = path_for("codex", "config.toml");
       let claude_path = path_for("claude", "settings.json");
-      write_text(&codex_path, r#"model_provider = "old"
+      write_text(
+        &codex_path,
+        r#"model_provider = "old"
 [model_providers.old]
 base_url = "https://old.example/v1"
-"#).expect("seed codex");
-      write_json(&claude_path, &json!({ "env": { "ANTHROPIC_BASE_URL": "https://old.example", "ANTHROPIC_API_KEY": "old" }, "permissions": { "allow": ["Bash(ls)"] } })).expect("seed claude");
+"#,
+      )
+      .expect("seed codex");
+      write_json(
+        &claude_path,
+        &json!({ "env": { "ANTHROPIC_BASE_URL": "https://old.example", "ANTHROPIC_API_KEY": "old" }, "permissions": { "allow": ["Bash(ls)"] } }),
+      )
+      .expect("seed claude");
 
       let mut t = target("claude");
       t.local_routing_enabled = true;
@@ -1180,7 +1315,8 @@ base_url = "https://old.example/v1"
       assert_eq!(claude["env"]["ANTHROPIC_BASE_URL"], "https://old.example");
       assert_eq!(claude["env"]["ANTHROPIC_API_KEY"], "old");
       assert_eq!(opencode["provider"]["ai8888"]["options"]["baseURL"], LOCAL_PROXY_OPENAI_BASE_URL);
-      assert_eq!(opencode["provider"]["ai8888"]["options"]["apiKey"], "PROXY_MANAGED");
+      let proxy_token = load_proxy_settings_checked().expect("load local proxy token").local_proxy_token;
+      assert_eq!(opencode["provider"]["ai8888"]["options"]["apiKey"], proxy_token);
     });
   }
 
@@ -1197,6 +1333,25 @@ base_url = "https://old.example/v1"
       assert_eq!(manifest.entries.iter().map(|entry| entry.app.as_str()).collect::<Vec<_>>(), vec!["codex", "claude", "opencode"]);
       let statuses = detect_local_route_statuses();
       assert!(statuses.iter().all(|status| status.detected), "statuses: {statuses:?}");
+    });
+  }
+
+  #[test]
+  fn legacy_proxy_marker_is_detected_for_migration_not_treated_as_ready() {
+    with_test_home("legacy-proxy-marker", || {
+      write_text(
+        &path_for("codex", "config.toml"),
+        &format!(
+          "model_provider = \"ai8888\"\n[model_providers.ai8888]\nbase_url = \"{}\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n",
+          LOCAL_PROXY_OPENAI_BASE_URL,
+        ),
+      )
+      .expect("seed legacy local route");
+
+      let status = detect_codex_local_route();
+      assert!(status.base_url_matched);
+      assert!(!status.proxy_key_matched);
+      assert!(!status.detected);
     });
   }
 
@@ -1219,18 +1374,22 @@ base_url = "https://old.example/v1"
   #[test]
   fn cleanup_local_route_takeover_cleans_opencode_proxy_marker() {
     with_test_home("cleanup-opencode", || {
-      write_json(&path_for("opencode", "opencode.json"), &json!({
-        "plugin": ["keep-me"],
-        "provider": {
-          "existing": { "name": "Existing" },
-          "ai8888": {
-            "npm": "@ai-sdk/openai-compatible",
-            "name": "AI8888",
-            "options": { "baseURL": LOCAL_PROXY_OPENAI_BASE_URL, "apiKey": "PROXY_MANAGED" },
-            "models": { "gpt-test": { "name": "gpt-test" } }
+      write_json(
+        &path_for("opencode", "opencode.json"),
+        &json!({
+          "plugin": ["keep-me"],
+          "provider": {
+            "existing": { "name": "Existing" },
+            "ai8888": {
+              "npm": "@ai-sdk/openai-compatible",
+              "name": "AI8888",
+              "options": { "baseURL": LOCAL_PROXY_OPENAI_BASE_URL, "apiKey": "PROXY_MANAGED" },
+              "models": { "gpt-test": { "name": "gpt-test" } }
+            }
           }
-        }
-      })).expect("seed opencode");
+        }),
+      )
+      .expect("seed opencode");
 
       cleanup_local_route_takeover().expect("cleanup");
       let value: serde_json::Value = read_json(&path_for("opencode", "opencode.json")).expect("read opencode");
@@ -1243,16 +1402,28 @@ base_url = "https://old.example/v1"
   #[test]
   fn cleanup_local_route_takeover_removes_proxy_markers() {
     with_test_home("cleanup", || {
-      write_text(&path_for("codex", "config.toml"), "model_provider = \"ai8888\"\n[model_providers.ai8888]\nname = \"AI8888\"\nbase_url = \"http://127.0.0.1:15888/v1\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n").expect("seed codex");
-      write_json(&path_for("claude", "settings.json"), &json!({
-        "env": {
-          "ANTHROPIC_BASE_URL": "http://127.0.0.1:15888",
-          "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
-          "ANTHROPIC_API_KEY": "PROXY_MANAGED",
-          "ANTHROPIC_MODEL": "gpt-test"
-        }
-      })).expect("seed claude");
-      write_text(&path_for("gemini", ".env"), "GOOGLE_GEMINI_BASE_URL=\"http://127.0.0.1:15888\"\nGEMINI_API_KEY=\"PROXY_MANAGED\"\nGEMINI_MODEL=\"gpt-test\"\nKEEP=\"yes\"\n").expect("seed gemini env");
+      write_text(
+        &path_for("codex", "config.toml"),
+        "model_provider = \"ai8888\"\n[model_providers.ai8888]\nname = \"AI8888\"\nbase_url = \"http://127.0.0.1:15888/v1\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n",
+      )
+      .expect("seed codex");
+      write_json(
+        &path_for("claude", "settings.json"),
+        &json!({
+          "env": {
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:15888",
+            "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+            "ANTHROPIC_API_KEY": "PROXY_MANAGED",
+            "ANTHROPIC_MODEL": "gpt-test"
+          }
+        }),
+      )
+      .expect("seed claude");
+      write_text(
+        &path_for("gemini", ".env"),
+        "GOOGLE_GEMINI_BASE_URL=\"http://127.0.0.1:15888\"\nGEMINI_API_KEY=\"PROXY_MANAGED\"\nGEMINI_MODEL=\"gpt-test\"\nKEEP=\"yes\"\n",
+      )
+      .expect("seed gemini env");
       let changed = cleanup_local_route_takeover().expect("cleanup");
       assert!(!changed.is_empty());
       let codex = fs::read_to_string(path_for("codex", "config.toml")).expect("read codex");
@@ -1269,14 +1440,80 @@ base_url = "https://old.example/v1"
   }
 
   #[test]
+  fn cleanup_codex_takeover_preserves_comments_unknown_fields_and_order() {
+    with_test_home("cleanup-codex-preserve-format", || {
+      let config_path = path_for("codex", "config.toml");
+      write_text(
+        &config_path,
+        r#"# keep root comment
+first_unknown = "first"
+model_provider = "ai8888"
+second_unknown = "second"
+
+[model_providers.ai8888]
+name = "AI8888"
+base_url = "http://127.0.0.1:15888/v1" # keep endpoint comment
+experimental_bearer_token = "PROXY_MANAGED"
+future_provider_option = "keep"
+
+[unrelated]
+enabled = true # keep unrelated comment
+"#,
+      )
+      .expect("seed codex route config");
+
+      cleanup_local_route_takeover().expect("cleanup local route");
+
+      let config = fs::read_to_string(&config_path).expect("read codex config");
+      assert!(config.contains("# keep root comment"));
+      assert!(config.contains("base_url = \"https://sub.ai8888.shop/v1\" # keep endpoint comment"));
+      assert!(config.contains("future_provider_option = \"keep\""));
+      assert!(config.contains("enabled = true # keep unrelated comment"));
+      assert!(!config.contains("experimental_bearer_token"));
+      assert!(config.find("first_unknown").unwrap() < config.find("model_provider").unwrap());
+      assert!(config.find("model_provider").unwrap() < config.find("second_unknown").unwrap());
+    });
+  }
+
+  #[test]
+  fn cleanup_codex_takeover_rejects_malformed_toml_without_overwriting_it() {
+    with_test_home("cleanup-codex-malformed", || {
+      let config_path = path_for("codex", "config.toml");
+      let malformed = "experimental_bearer_token = \"PROXY_MANAGED\"\n[broken\n";
+      write_text(&config_path, malformed).expect("seed malformed codex config");
+
+      cleanup_local_route_takeover().expect_err("malformed config must be rejected");
+
+      assert_eq!(fs::read_to_string(&config_path).expect("read malformed config"), malformed);
+    });
+  }
+
+  #[test]
+  fn cleanup_codex_takeover_does_not_remove_a_real_token() {
+    with_test_home("cleanup-codex-real-token", || {
+      let config_path = path_for("codex", "config.toml");
+      let original = "model_provider = \"ai8888\"\n[model_providers.ai8888]\nbase_url = \"https://sub.ai8888.shop/v1\"\nexperimental_bearer_token = \"sk-real\" # keep real token\n";
+      write_text(&config_path, original).expect("seed real token config");
+
+      cleanup_local_route_takeover().expect("cleanup local route");
+
+      assert_eq!(fs::read_to_string(&config_path).expect("read codex config"), original);
+    });
+  }
+
+  #[test]
   fn opencode_write_upserts_ai8888_provider_and_preserves_existing_config() {
     with_test_home("opencode", || {
       let path = path_for("opencode", "opencode.json");
-      write_json(&path, &json!({
-        "$schema": "https://opencode.ai/config.json",
-        "plugin": ["keep-me"],
-        "provider": { "existing": { "name": "Existing" } }
-      })).expect("seed opencode");
+      write_json(
+        &path,
+        &json!({
+          "$schema": "https://opencode.ai/config.json",
+          "plugin": ["keep-me"],
+          "provider": { "existing": { "name": "Existing" } }
+        }),
+      )
+      .expect("seed opencode");
       write_switch_target(&target("opencode")).expect("write opencode");
       let value: serde_json::Value = read_json(&path).expect("read opencode");
       assert_eq!(value["plugin"][0], "keep-me");
@@ -1293,10 +1530,14 @@ base_url = "https://old.example/v1"
   fn openclaw_write_upserts_models_provider_and_preserves_existing_config() {
     with_test_home("openclaw", || {
       let path = path_for("openclaw", "openclaw.json");
-      write_json(&path, &json!({
-        "tools": { "keep": true },
-        "models": { "mode": "merge", "providers": { "existing": { "apiKey": "old" } } }
-      })).expect("seed openclaw");
+      write_json(
+        &path,
+        &json!({
+          "tools": { "keep": true },
+          "models": { "mode": "merge", "providers": { "existing": { "apiKey": "old" } } }
+        }),
+      )
+      .expect("seed openclaw");
       write_switch_target(&target("openclaw")).expect("write openclaw");
       let value: serde_json::Value = read_json(&path).expect("read openclaw");
       assert_eq!(value["tools"]["keep"], true);
@@ -1328,4 +1569,3 @@ base_url = "https://old.example/v1"
     });
   }
 }
-

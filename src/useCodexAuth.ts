@@ -9,6 +9,14 @@ export type CodexAuthStatus = {
   statusMessage: string;
   activeProvider: string;
   ai8888ConfigAvailable: boolean;
+  configExists?: boolean;
+  configValid?: boolean;
+  configError?: string | null;
+  configuredModel?: string | null;
+  configuredReviewModel?: string | null;
+  configuredBaseUrl?: string | null;
+  configuredKeyId?: number | null;
+  configuredKeyName?: string | null;
   credentialStore: string;
   configPath: string;
   loginRunning: boolean;
